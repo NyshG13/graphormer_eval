@@ -1,4 +1,4 @@
-out_dir: tests/results/peptides-func-ensemble
+out_dir: tests/results/peptides-func-ensemble-shared
 metric_best: ap
 wandb:
   use: True
@@ -37,7 +37,7 @@ train:
   eval_period: 1
   ckpt_period: 100
 model:
-  type: ensemble_s2gnn
+  type: shared_ensemble_s2gnn
   loss_fun: cross_entropy
   edge_decoding: dot
   graph_pooling: mean
