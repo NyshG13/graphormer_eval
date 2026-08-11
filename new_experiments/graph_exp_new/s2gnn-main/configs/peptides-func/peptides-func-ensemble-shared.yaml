@@ -71,7 +71,6 @@ gnn:
     basis_bottleneck: 0.2
     num_heads_filter_encoder: 128
 optim:
-  batch_accumulation: 3
   clip_grad_norm: True
   optimizer: adamW
   weight_decay: 0.0035
