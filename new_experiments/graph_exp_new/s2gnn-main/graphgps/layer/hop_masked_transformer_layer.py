@@ -179,10 +179,14 @@ class HopMaskedMHA(nn.Module):
         # Padding masks.
         key_pad = (~node_mask).unsqueeze(1).unsqueeze(2)      # (B, 1, 1, N)
         query_pad = (~node_mask).unsqueeze(1).unsqueeze(-1)   # (B, 1, N, 1)
+        
+        # Mask keys before softmax so padding keys are ignored
         scores = scores.masked_fill(key_pad, _NEG_INF)
-        scores = scores.masked_fill(query_pad, _NEG_INF)
 
         attn = F.softmax(scores, dim=-1)
+        
+        # Zero out padding queries after softmax to avoid NaN gradients
+        attn = attn.masked_fill(query_pad, 0.0)
         attn = torch.nan_to_num(attn, nan=0.0)
         attn = self.attn_drop(attn)
 
