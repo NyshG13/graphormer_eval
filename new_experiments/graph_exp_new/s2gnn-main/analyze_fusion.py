@@ -10,8 +10,13 @@ def analyze_fusion_weights(ckpt_path):
         print(f"Error loading checkpoint: {e}")
         return
 
-    # PyTorch Lightning wraps the model in a module, usually 'model.' prefix
-    state_dict = checkpoint.get('state_dict', checkpoint)
+    # PyTorch Lightning uses 'state_dict', pure GraphGym uses 'model_state'
+    if 'model_state' in checkpoint:
+        state_dict = checkpoint['model_state']
+    elif 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
     
     # We are looking for the first linear layer in the GNNHead (post_mp)
     # In MLPGraphHead, it's typically self.mlp[1] (index 0 is Dropout)
