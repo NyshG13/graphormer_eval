@@ -56,13 +56,11 @@ class SharedEnsembleS2GNN(nn.Module):
         self.branch_b.encoder = nn.Identity()
         self.branch_b.post_mp = nn.Identity()
 
-        # Both branches return node embeddings of size `cfg.gnn.dim_inner`
-        self.concat_dim = cfg.gnn.dim_inner * 2
-
-        # Unified Ensemble Head
+        # Unified Ensemble Head (Modified for Boosting)
         GNNHead = register.head_dict[cfg.gnn.head]
         is_first = cfg.gnn.layers_mp <= 0
-        self.post_mp = GNNHead(self.concat_dim, dim_out, is_first)
+        self.post_mp_a = GNNHead(cfg.gnn.dim_inner, dim_out, is_first)
+        self.post_mp_b = GNNHead(cfg.gnn.dim_inner, dim_out, is_first)
 
     def forward(self, batch):
         # Set num_graphs if not available
@@ -85,8 +83,35 @@ class SharedEnsembleS2GNN(nn.Module):
         batch_a = self.branch_a(batch_a)
         batch_b = self.branch_b(batch_b)
 
-        # 4. Concatenate and fuse
-        batch.x = torch.cat([batch_a.x, batch_b.x], dim=-1)
-        batch = self.post_mp(batch)
-
-        return batch
+        # 4. Independent Predictions
+        # S2GNN Head
+        batch_a_copy = batch.clone()
+        batch_a_copy.x = batch_a.x
+        out_a = self.post_mp_a(batch_a_copy)
+        
+        # Hop-Masked Head
+        batch_b_copy = batch.clone()
+        batch_b_copy.x = batch_b.x
+        out_b = self.post_mp_b(batch_b_copy)
+        
+        # Extract predictions (handling different return tuple lengths)
+        if isinstance(out_a, tuple):
+            pred_a = out_a[0]
+            label = out_a[1]
+        else:
+            pred_a = out_a
+            label = None
+            
+        if isinstance(out_b, tuple):
+            pred_b = out_b[0]
+        else:
+            pred_b = out_b
+            
+        pred_final = pred_a + pred_b
+        
+        if self.training:
+            return (pred_a, pred_final), label
+        else:
+            if isinstance(out_a, tuple) and len(out_a) > 2:
+                return pred_final, label, out_a[2]
+            return pred_final, label

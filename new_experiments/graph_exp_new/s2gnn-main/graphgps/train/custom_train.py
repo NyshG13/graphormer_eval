@@ -32,13 +32,28 @@ def train_epoch(logger, loader, model, avg_model,
         if cfg.dataset.name == 'source-dist':
             # Get predictions to a reasonable range
             num_nodes_per_graph = batch.ptr.diff()[batch.batch][:, None]
-            pred = torch.tanh(pred / num_nodes_per_graph) * num_nodes_per_graph
+            if isinstance(pred, tuple) and len(pred) == 2:
+                pred = (torch.tanh(pred[0] / num_nodes_per_graph) * num_nodes_per_graph,
+                        torch.tanh(pred[1] / num_nodes_per_graph) * num_nodes_per_graph)
+            else:
+                pred = torch.tanh(pred / num_nodes_per_graph) * num_nodes_per_graph
+                
         if cfg.dataset.name == 'ogbg-code2':
-            loss, pred_score = subtoken_cross_entropy(pred, true)
+            if isinstance(pred, tuple) and len(pred) == 2:
+                loss_1, _ = subtoken_cross_entropy(pred[0], true)
+                loss_2, pred_score = subtoken_cross_entropy(pred[1], true)
+                loss = loss_1 + loss_2
+            else:
+                loss, pred_score = subtoken_cross_entropy(pred, true)
             _true = true
             _pred = pred_score
         else:
-            loss, pred_score = compute_loss(pred, true)
+            if isinstance(pred, tuple) and len(pred) == 2:
+                loss_1, _ = compute_loss(pred[0], true)
+                loss_2, pred_score = compute_loss(pred[1], true)
+                loss = loss_1 + loss_2
+            else:
+                loss, pred_score = compute_loss(pred, true)
             _true = true.detach().to('cpu', non_blocking=True)
             _pred = pred_score.detach().to('cpu', non_blocking=True)
         loss.backward()
