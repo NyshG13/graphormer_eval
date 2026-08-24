@@ -301,10 +301,15 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
             save_ckpt(model, optimizer, scheduler, cur_epoch - 1, {})
             logging.info('[Boosting] Phase 1 checkpoint saved.')
 
-            # Unwrap model if using DataParallel / model averaging
+            # Unwrap model if using DataParallel / model averaging / GraphGymModule
             raw_model = model
-            if hasattr(model, 'module'):
-                raw_model = model.module
+            while not hasattr(raw_model, 'enter_phase2'):
+                if hasattr(raw_model, 'module'):
+                    raw_model = raw_model.module
+                elif hasattr(raw_model, 'model'):
+                    raw_model = raw_model.model
+                else:
+                    raise RuntimeError("Could not find 'enter_phase2' in model hierarchy.")
 
             # Freeze encoder + Branch A, enable Branch B
             raw_model.enter_phase2()
