@@ -11,6 +11,7 @@ from scipy.sparse.csgraph import floyd_warshall
 from scipy.sparse.linalg import eigsh
 from functools import partial
 from multiprocessing import Pool
+from oversquashing import OverSquashingDataset
 
 
 # ================================================================
@@ -116,6 +117,16 @@ GRAPH_DATASETS = {
         "source": "zinc",
         "pyg_name": "ZINC",
         "subset": True,
+    },
+    "over-squashing": {
+        "output_dim": 5,
+        "task_type": "multiclass",
+        "level": "graph",
+        "node_encoder": "linear",
+        "node_feat_dim": 5,
+        "metric_name": "accuracy",
+        "source": "synthetic",
+        "pyg_name": "over-squashing",
     },
 }
 
@@ -417,6 +428,8 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
         if source == "zinc":
             return ZINC(root="./data/ZINC", subset=bool(info.get("subset", False)),
                         split=split, transform=transform)
+        if source == "synthetic" and dataset_name == "over-squashing":
+            return OverSquashingDataset(root="./data", name=pyg_name, split=split)
         raise ValueError(f"Unknown dataset source '{source}' for {dataset_name}.")
 
     train_ds = _build_dataset("train")
