@@ -61,6 +61,9 @@ gnn:
     num_hops: 30
     num_heads: 30
     ffn_ratio: 1
+    boosting:
+      enable: True
+      phase1_epochs: 100
   spectral:
     layer_skip: [3]
     frequency_cutoff: 0.7
@@ -76,7 +79,7 @@ optim:
   optimizer: adamW
   weight_decay: 0.0035
   base_lr: 0.00225
-  max_epoch: 250
+  max_epoch: 350
   scheduler: cosine_with_warmup
   num_warmup_epochs: 5
 share:

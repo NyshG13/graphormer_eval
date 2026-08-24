@@ -36,3 +36,11 @@ def hop_masked_cfg(cfg):
 
     # FFN inner-dim multiplier (ffn_dim = hidden_dim * ffn_ratio).
     cfg.gnn.hop_masked.ffn_ratio = 1
+
+    # --- Boosting: two-phase training where Branch B learns residuals ---
+    # Phase 1: Train S2GNN (Branch A) to convergence on original targets.
+    # Phase 2: Freeze encoder + Branch A, train HopMasked (Branch B) on
+    #          residuals (true - pred_a).
+    cfg.gnn.hop_masked.boosting = CN()
+    cfg.gnn.hop_masked.boosting.enable = False
+    cfg.gnn.hop_masked.boosting.phase1_epochs = 100

@@ -14,6 +14,9 @@ from torch_geometric.graphgym.utils.epoch import is_eval_epoch, is_ckpt_epoch
 from torch_sparse import SparseTensor
 import torch.nn.functional as F
 
+from torch_geometric.graphgym.optim import create_optimizer, \
+    create_scheduler, OptimizerConfig
+from graphgps.optimizer.extra_optimizers import ExtendedSchedulerConfig
 from graphgps.checkpoint import load_ckpt, save_ckpt, clean_ckpt, get_ckpt_dir
 from graphgps.loss.subtoken_prediction_loss import subtoken_cross_entropy
 from graphgps.utils import cfg_to_dict, flatten_dict, make_wandb_name
@@ -270,9 +273,70 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
     split_names = ['val', 'test']
     full_epoch_times = []
     perf = [[] for _ in range(num_splits)]
+
+    # --- Boosting: check if phase transition is needed ---
+    boosting_enabled = (hasattr(cfg.gnn, 'hop_masked')
+                        and hasattr(cfg.gnn.hop_masked, 'boosting')
+                        and cfg.gnn.hop_masked.boosting.enable)
+    if boosting_enabled:
+        phase1_epochs = cfg.gnn.hop_masked.boosting.phase1_epochs
+        logging.info(f'[Boosting] Enabled. Phase 1 runs for {phase1_epochs} '
+                     f'epochs, Phase 2 for remaining '
+                     f'{cfg.optim.max_epoch - phase1_epochs} epochs.')
+        phase_transitioned = False
+    else:
+        phase1_epochs = cfg.optim.max_epoch  # never transition
+        phase_transitioned = True  # skip transition logic
+
     for cur_epoch in range(start_epoch, cfg.optim.max_epoch):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+        # --- Boosting: Phase transition at phase1_epochs ---
+        if boosting_enabled and not phase_transitioned and cur_epoch >= phase1_epochs:
+            logging.info(f'[Boosting] Phase 1 complete at epoch {cur_epoch}. '
+                         f'Transitioning to Phase 2.')
+
+            # Save Phase 1 checkpoint (best S2GNN model)
+            save_ckpt(model, optimizer, scheduler, cur_epoch - 1, {})
+            logging.info('[Boosting] Phase 1 checkpoint saved.')
+
+            # Unwrap model if using DataParallel / model averaging
+            raw_model = model
+            if hasattr(model, 'module'):
+                raw_model = model.module
+
+            # Freeze encoder + Branch A, enable Branch B
+            raw_model.enter_phase2()
+
+            # Rebuild optimizer with only trainable (Branch B) params
+            optimizer_cfg = OptimizerConfig(
+                optimizer=cfg.optim.optimizer,
+                base_lr=cfg.optim.base_lr,
+                weight_decay=cfg.optim.weight_decay,
+                momentum=cfg.optim.momentum)
+            optimizer = create_optimizer(raw_model.parameters(), optimizer_cfg)
+
+            # Rebuild scheduler for Phase 2 (fresh warmup + cosine)
+            phase2_epochs = cfg.optim.max_epoch - phase1_epochs
+            scheduler_cfg = ExtendedSchedulerConfig(
+                scheduler=cfg.optim.scheduler,
+                steps=cfg.optim.steps,
+                lr_decay=cfg.optim.lr_decay,
+                max_epoch=phase2_epochs,
+                reduce_factor=cfg.optim.reduce_factor,
+                schedule_patience=cfg.optim.schedule_patience,
+                min_lr=cfg.optim.min_lr,
+                num_warmup_epochs=cfg.optim.num_warmup_epochs,
+                train_mode=cfg.train.mode,
+                eval_period=cfg.train.eval_period)
+            scheduler = create_scheduler(optimizer, scheduler_cfg)
+
+            # Reset best-epoch tracking for Phase 2
+            perf = [[] for _ in range(num_splits)]
+
+            phase_transitioned = True
+            logging.info('[Boosting] Phase 2 optimizer and scheduler ready.')
 
         start_time = time.perf_counter()
         pred, data = [], []
