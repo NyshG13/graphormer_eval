@@ -429,7 +429,10 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
             return ZINC(root="./data/ZINC", subset=bool(info.get("subset", False)),
                         split=split, transform=transform)
         if source == "synthetic" and dataset_name == "over-squashing":
-            return OverSquashingDataset(root="./data", name=pyg_name, split=split)
+            dataset = OverSquashingDataset(root="./data")
+            split_idx = dataset.get_idx_split()
+            mapped_split = "valid" if split == "val" else split
+            return dataset[split_idx[mapped_split]]
         raise ValueError(f"Unknown dataset source '{source}' for {dataset_name}.")
 
     train_ds = _build_dataset("train")
