@@ -284,6 +284,17 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
                      f'epochs, Phase 2 for remaining '
                      f'{cfg.optim.max_epoch - phase1_epochs} epochs.')
         phase_transitioned = False
+
+        if start_epoch > phase1_epochs:
+            logging.info('[Boosting] Resumed in Phase 2. Freezing Phase 1 params.')
+            raw_model = model
+            while not hasattr(raw_model, 'enter_phase2'):
+                if hasattr(raw_model, 'module'): raw_model = raw_model.module
+                elif hasattr(raw_model, 'model'): raw_model = raw_model.model
+                else: break
+            if hasattr(raw_model, 'enter_phase2'):
+                raw_model.enter_phase2()
+            phase_transitioned = True
     else:
         phase1_epochs = cfg.optim.max_epoch  # never transition
         phase_transitioned = True  # skip transition logic
@@ -320,7 +331,7 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
                 base_lr=cfg.optim.base_lr,
                 weight_decay=cfg.optim.weight_decay,
                 momentum=cfg.optim.momentum)
-            optimizer = create_optimizer(raw_model.parameters(), optimizer_cfg)
+            optimizer = create_optimizer(filter(lambda p: p.requires_grad, raw_model.parameters()), optimizer_cfg)
 
             # Rebuild scheduler for Phase 2 (fresh warmup + cosine)
             phase2_epochs = cfg.optim.max_epoch - phase1_epochs
