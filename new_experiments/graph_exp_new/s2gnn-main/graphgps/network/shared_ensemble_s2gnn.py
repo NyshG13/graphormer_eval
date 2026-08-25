@@ -189,12 +189,8 @@ class SharedEnsembleS2GNN(nn.Module):
             # Run Branch B on the same encoded features
             pred_b = self._run_branch_b(encoded_batch)
 
-            if self.training:
-                # Training: return (pred_b, residual) so compute_loss
-                # trains Branch B to predict the residual = true - pred_a
-                residual = label - pred_a
-                return pred_b, residual
-            else:
-                # Eval: final prediction is the boosted sum
-                pred_final = pred_a + pred_b
-                return pred_final, label
+            # Return the combined prediction and original label.
+            # During training, the native loss function (e.g. BCE or L1) will 
+            # automatically backpropagate through pred_b to correct pred_a's mistakes.
+            pred_final = pred_a + pred_b
+            return pred_final, label
