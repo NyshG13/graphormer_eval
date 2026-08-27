@@ -47,6 +47,15 @@ _CHECKPOINT_FOR_DOC = "graphormer-base-pcqm4mv1"
 _CONFIG_FOR_DOC = "GraphormerConfig"
 
 
+def enable_attention_diagnostics(model, enabled=True, log_interval=50):
+    """Enable or disable attention mask density & entropy logging on all attention layers."""
+    for module in model.modules():
+        if isinstance(module, GraphormerMultiheadAttention):
+            module._diagnostics_enabled = enabled
+            module._diag_log_interval = log_interval
+            module._diag_step_counter = 0
+
+
 def compute_attention_snr(attn_weights, labels, node_mask):
     """
     Compute AttentionSNR: 10*log10(sum(attn_score_same_class)/sum(attn_score_diff_class))
@@ -264,6 +273,11 @@ class GraphormerMultiheadAttention(nn.Module):
         self.out_proj = nn.Linear(config.embedding_dim, config.embedding_dim, bias=config.bias)
 
         self.onnx_trace = False
+        # Diagnostics: set layer_idx externally, log every N steps
+        self.layer_idx = -1
+        self._diagnostics_enabled = False
+        self._diag_step_counter = 0
+        self._diag_log_interval = 50  # log every 50 forward passes
         if self.config.enable_layerwise_diffusion:
             self.diffusion_model = GraphLatentDiffusion(
                 self.kdim, config.embedding_dim, config.diffusion_steps, config=self.config)
@@ -393,6 +407,32 @@ class GraphormerMultiheadAttention(nn.Module):
         if before_softmax:
             return attn_weights, v
 
+        # --- Diagnostics: mask density (pre-softmax) ---
+        if self._diagnostics_enabled:
+            self._diag_step_counter += 1
+            if self._diag_step_counter % self._diag_log_interval == 0:
+                with torch.no_grad():
+                    # attn_weights shape: [bsz * num_heads, tgt_len, src_len]
+                    # A position is masked if its pre-softmax value is -inf
+                    is_masked = torch.isinf(attn_weights) & (attn_weights < 0)
+                    total_positions = attn_weights.numel()
+                    masked_positions = is_masked.sum().item()
+                    pct_active = (1.0 - masked_positions / total_positions) * 100
+
+                    # Per-head mask density: reshape to [bsz, num_heads, tgt_len, src_len]
+                    is_masked_per_head = is_masked.view(bsz, self.num_heads, tgt_len, src_len)
+                    diag_payload = {
+                        f"mask_diag/layer{self.layer_idx}_pct_active_overall": pct_active,
+                    }
+                    for h in range(self.num_heads):
+                        head_mask = is_masked_per_head[:, h, :, :]
+                        head_pct_active = (1.0 - head_mask.sum().item() / head_mask.numel()) * 100
+                        diag_payload[f"mask_diag/layer{self.layer_idx}_head{h}_pct_active"] = head_pct_active
+
+                    step_val = getattr(self.config, 'current_step', self._diag_step_counter)
+                    diag_payload["step"] = step_val
+                    wandb.log(diag_payload)
+
         # --- Diffusion part ----
         if self.config.enable_layerwise_diffusion:
             attn_weights = self.remove_attention_noise(  # TODO: Implement this method
@@ -402,6 +442,33 @@ class GraphormerMultiheadAttention(nn.Module):
 
         attn_weights_float = torch.nn.functional.softmax(attn_weights, dim=-1)
         attn_weights = attn_weights_float.type_as(attn_weights)
+
+        # --- Diagnostics: attention entropy (post-softmax) ---
+        if self._diagnostics_enabled and (self._diag_step_counter % self._diag_log_interval == 0):
+            with torch.no_grad():
+                # attn_weights_float: [bsz * num_heads, tgt_len, src_len]
+                # Entropy per row: -sum(p * log(p)), ignoring zeros
+                p = attn_weights_float.clamp(min=1e-12)
+                row_entropy = -(p * p.log()).sum(dim=-1)  # [bsz * num_heads, tgt_len]
+                # Max possible entropy for reference (uniform over all src_len)
+                max_entropy = math.log(src_len)
+
+                # Per-head entropy: reshape to [bsz, num_heads, tgt_len]
+                row_entropy_per_head = row_entropy.view(bsz, self.num_heads, tgt_len)
+                entropy_payload = {
+                    f"attn_entropy/layer{self.layer_idx}_mean": row_entropy.mean().item(),
+                    f"attn_entropy/layer{self.layer_idx}_max_possible": max_entropy,
+                    f"attn_entropy/layer{self.layer_idx}_normalized_mean": (row_entropy.mean().item() / max_entropy) if max_entropy > 0 else 0,
+                }
+                for h in range(self.num_heads):
+                    head_entropy = row_entropy_per_head[:, h, :].mean().item()
+                    entropy_payload[f"attn_entropy/layer{self.layer_idx}_head{h}_mean"] = head_entropy
+                    entropy_payload[f"attn_entropy/layer{self.layer_idx}_head{h}_normalized"] = (head_entropy / max_entropy) if max_entropy > 0 else 0
+
+                step_val = getattr(self.config, 'current_step', self._diag_step_counter)
+                entropy_payload["step"] = step_val
+                wandb.log(entropy_payload)
+
         attn_probs = self.attention_dropout_module(attn_weights_float)
 
         if v is None:
@@ -611,6 +678,9 @@ class GraphormerGraphEncoder(nn.Module):
 
         for layer_idx, layer in enumerate(self.layers):
             # logging.info(f"Processing layer:, {layer}, FOR INPUT:, {tuple(input_nodes.shape)}")
+            # Set layer index for diagnostics
+            layer.self_attn.layer_idx = layer_idx
+
             override = None
             if attn_override is not None and layer_idx in attn_override:
                 override = attn_override[layer_idx]
@@ -1070,5 +1140,7 @@ __all__ = [
     # "GraphormerForGraphClassification",
     "GraphormerForNodeClassification",
     "GraphormerModel",
+    "enable_attention_diagnostics",
     # "GraphormerPreTrainedModel"
 ]
+
