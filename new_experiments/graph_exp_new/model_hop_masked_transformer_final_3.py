@@ -1538,19 +1538,6 @@ class HopMaskedTransformerModel(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
 
-        # Link-level tasks (PCQM-Contact): decode per-node embeddings that are
-        # scored by dot product for pair prediction. Replaces the classifier
-        # head; pair construction + MRR live in the link epoch loop.
-        self.link_head = None
-        if task_level == "link":
-            self.link_head = nn.Sequential(
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
-
         if use_virtual_node:
             self.vn_embed = nn.Parameter(
                 torch.randn(1, 1, hidden_dim) * hidden_dim ** -0.5
@@ -2043,11 +2030,6 @@ class HopMaskedTransformerModel(nn.Module):
         if self.post_gat is not None:
             edge_attr = getattr(batch, "edge_attr", None) if self.use_edge_features else None
             node_emb = self.post_gat(node_emb, batch.edge_index, edge_attr=edge_attr)
-
-        if self.task_level == "link":
-            # Decoded per-node embeddings (global node order aligned with the
-            # batch); the epoch loop scores node pairs by dot product.
-            return self.link_head(node_emb), node_emb, aux_loss, _exported_gw
 
         if self.task_level == "node":
             return self.head(node_emb), node_emb, aux_loss, _exported_gw
