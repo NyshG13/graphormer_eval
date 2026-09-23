@@ -36,3 +36,8 @@ def hop_masked_cfg(cfg):
 
     # FFN inner-dim multiplier (ffn_dim = hidden_dim * ffn_ratio).
     cfg.gnn.hop_masked.ffn_ratio = 1
+
+    # Exp 4 only: number of restricted heads (from head 0) that use
+    # path-aware value augmentation (V[j] += beta * W_path(x[m])).
+    # Set to 0 to disable path augmentation (falls back to Exp-1 behaviour).
+    cfg.gnn.hop_masked.num_path_heads = 4

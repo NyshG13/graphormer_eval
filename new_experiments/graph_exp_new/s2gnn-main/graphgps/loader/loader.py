@@ -428,7 +428,17 @@ def create_loader():
     use_hop_masked = (hasattr(cfg.gnn, 'hop_masked')
                       and getattr(cfg.gnn.hop_masked, 'enable', False))
 
-    all_dist_masks = None
+    # Detect whether this model type needs path features (Exp 1 / 3 / 4).
+    _path_exp_types = {
+        'hop_masked_s2gnn_exp1',
+        'hop_masked_s2gnn_exp3',
+        'hop_masked_s2gnn_exp4',
+    }
+    use_path_features = (use_hop_masked
+                         and cfg.model.type in _path_exp_types)
+
+    all_dist_masks  = None
+    all_path_feats  = None
     if use_hop_masked:
         from graphgps.loader.dist_mask_utils import (
             precompute_distance_masks,
@@ -449,7 +459,24 @@ def create_loader():
         all_dist_masks = precompute_distance_masks(
             dataset, cache_path, max_hops=max_hops, num_workers=8,
         )
-        collate_fn = partial(collate_s2gnn_dist_masks, max_hops=max_hops)
+
+        if use_path_features:
+            from graphgps.loader.path_mask_utils import (
+                precompute_path_features,
+                PathFeatureGraphDataset,
+                collate_path_features,
+            )
+            path_cache_dir = os.path.join(cfg.dataset.dir,
+                                          cfg.dataset.name.replace('-', '_'),
+                                          'path_features')
+            logging.info(f"[HopMasked] Precomputing / loading path features "
+                         f"(max_hops={max_hops})...")
+            all_path_feats = precompute_path_features(
+                dataset, path_cache_dir, max_hops=max_hops, num_workers=8,
+            )
+            collate_fn = partial(collate_path_features, max_hops=max_hops)
+        else:
+            collate_fn = partial(collate_s2gnn_dist_masks, max_hops=max_hops)
 
     # ---- Build loaders per split ------------------------------------------
     if cfg.dataset.task == 'graph':
@@ -457,7 +484,12 @@ def create_loader():
 
         if use_hop_masked:
             train_dm = [all_dist_masks[i] for i in train_id.tolist()]
-            wrapped = DistMaskGraphDataset(dataset[train_id], train_dm)
+            if use_path_features:
+                train_pf = [all_path_feats[i] for i in train_id.tolist()]
+                wrapped = PathFeatureGraphDataset(dataset[train_id],
+                                                  train_dm, train_pf)
+            else:
+                wrapped = DistMaskGraphDataset(dataset[train_id], train_dm)
             pw = cfg.num_workers > 0
             loaders = [
                 TorchDataLoader(wrapped, batch_size=cfg.train.batch_size,
@@ -488,7 +520,12 @@ def create_loader():
 
             if use_hop_masked:
                 split_dm = [all_dist_masks[j] for j in split_id.tolist()]
-                wrapped = DistMaskGraphDataset(dataset[split_id], split_dm)
+                if use_path_features:
+                    split_pf = [all_path_feats[j] for j in split_id.tolist()]
+                    wrapped = PathFeatureGraphDataset(dataset[split_id],
+                                                      split_dm, split_pf)
+                else:
+                    wrapped = DistMaskGraphDataset(dataset[split_id], split_dm)
                 pw = cfg.num_workers > 0
                 loaders.append(
                     TorchDataLoader(wrapped, batch_size=cfg.train.batch_size,
