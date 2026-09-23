@@ -14,9 +14,10 @@ All arrays use small dtypes to keep cache files compact.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import os
 import pickle
-from functools import partial
 from typing import Dict
 
 import numpy as np
@@ -161,9 +162,12 @@ def precompute_path_features(dataset, cache_dir: str, max_hops: int = 40,
             adj[ei[1], ei[0]] = 1.0   # undirected
         adjs.append(adj)
 
-    features = []
-    for adj in tqdm(adjs, desc="  [HopMasked] Path features", ncols=80):
-        features.append(_compute_path_features_single(adj, max_hops=max_hops))
+    workers = min(num_workers, os.cpu_count() or 8)
+    compute_fn = partial(_compute_path_features_single, max_hops=max_hops)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        features = list(tqdm(executor.map(compute_fn, adjs), total=len(adjs),
+                             desc="  [HopMasked] Path features", ncols=80))
 
     os.makedirs(cache_dir, exist_ok=True)
     with open(cache_path, "wb") as f:
