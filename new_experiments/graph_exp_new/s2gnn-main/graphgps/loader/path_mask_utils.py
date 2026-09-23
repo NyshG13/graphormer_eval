@@ -17,15 +17,15 @@ from __future__ import annotations
 import os
 import pickle
 from functools import partial
-from multiprocessing import Pool
 from typing import Dict
 
 import numpy as np
 from scipy.sparse.csgraph import floyd_warshall
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
-# Per-graph computation (runs in a worker process)
+# Per-graph computation
 # ---------------------------------------------------------------------------
 
 def _compute_path_features_single(adj: np.ndarray, max_hops: int = 40) -> Dict[str, np.ndarray]:
@@ -41,6 +41,13 @@ def _compute_path_features_single(adj: np.ndarray, max_hops: int = 40) -> Dict[s
     dict with keys: dist_int, sigma, cnbr, path_mid
     """
     N = adj.shape[0]
+    if N == 0:
+        return {
+            "dist_int": np.empty((0, 0), dtype=np.int16),
+            "sigma":    np.empty((0, 0), dtype=np.int32),
+            "cnbr":     np.empty((0, 0), dtype=np.int16),
+            "path_mid": np.empty((0, 0), dtype=np.int16),
+        }
 
     # ------------------------------------------------------------------
     # 1.  Shortest-path distances via Floyd-Warshall
@@ -50,65 +57,50 @@ def _compute_path_features_single(adj: np.ndarray, max_hops: int = 40) -> Dict[s
                         dist_float, -1).astype(np.int16)
 
     # ------------------------------------------------------------------
-    # 2.  Number of shortest paths  σ(i,j)
-    #     Standard BFS-based counting: run BFS from each source node.
-    # ------------------------------------------------------------------
-    sigma = np.zeros((N, N), dtype=np.int32)
-    parent_sets = [[set() for _ in range(N)] for _ in range(N)]  # parent_sets[s][v]
-
-    for s in range(N):
-        visited = np.full(N, -1, dtype=np.int32)   # distance from s
-        visited[s] = 0
-        sigma[s, s] = 1
-        queue = [s]
-        head = 0
-        while head < len(queue):
-            u = queue[head]; head += 1
-            neighbors = np.where(adj[u] > 0)[0]
-            for v in neighbors:
-                if visited[v] == -1:
-                    visited[v] = visited[u] + 1
-                    queue.append(v)
-                if visited[v] == visited[u] + 1:
-                    sigma[s, v] += sigma[s, u]
-                    parent_sets[s][v].add(u)
-
-    # ------------------------------------------------------------------
-    # 3.  Common-neighbour count  |N(i) ∩ N(j)|
-    #     = (A @ A)[i,j]  for unweighted undirected graphs
+    # 2.  Common-neighbour count  |N(i) ∩ N(j)| = (A @ A)[i,j]
     # ------------------------------------------------------------------
     cnbr = (adj @ adj).astype(np.int16)
-    # Clip to int16 range (unlikely to exceed it for molecular graphs)
     cnbr = np.clip(cnbr, 0, np.iinfo(np.int16).max).astype(np.int16)
 
     # ------------------------------------------------------------------
-    # 4.  One BFS-intermediate node for each pair (i,j) with d(i,j) ≥ 2
-    #     Use the parent_sets computed above: for pair (s,v), pick the
-    #     first parent of v on a shortest path from s, then pick the
-    #     first parent of *that* node, ..., until we have a node at
-    #     distance 1 from s.  The intermediate node is the neighbour of
-    #     s that lies on the path — i.e. the node at distance 1 from s
-    #     on the BFS tree toward v.
+    # 3.  Number of shortest paths σ(i,j) &
+    # 4.  One BFS-intermediate node path_mid for d(i,j) >= 2
     # ------------------------------------------------------------------
+    sigma = np.zeros((N, N), dtype=np.int32)
     path_mid = np.full((N, N), -1, dtype=np.int16)
 
+    # Pre-build neighbor lists for rapid BFS (avoiding inner-loop allocations)
+    adj_list = [np.flatnonzero(adj[i]) for i in range(N)]
+
     for s in range(N):
-        # For each reachable node v at distance >= 2:
-        dist_s = np.where(np.isfinite(dist_float[s]), dist_float[s], -1).astype(int)
+        visited_dist = np.full(N, -1, dtype=np.int32)
+        visited_dist[s] = 0
+        sigma[s, s] = 1
+
+        first_hop = np.full(N, -1, dtype=np.int16)
+        queue = [s]
+        head = 0
+
+        while head < len(queue):
+            u = queue[head]
+            head += 1
+            d_next = visited_dist[u] + 1
+
+            for v in adj_list[u]:
+                if visited_dist[v] == -1:
+                    visited_dist[v] = d_next
+                    queue.append(v)
+                    if u == s:
+                        first_hop[v] = v
+                    else:
+                        first_hop[v] = first_hop[u]
+
+                if visited_dist[v] == d_next:
+                    sigma[s, v] += sigma[s, u]
+
         for v in range(N):
-            d = dist_s[v]
-            if d < 2:
-                continue   # -1 (unreachable) or 0/1 (no intermediate)
-            # Walk back from v toward s along parent pointers until
-            # we reach a node at distance 1 from s.  That node is the
-            # first-hop intermediate on the path s → ... → v.
-            cur = v
-            while dist_s[cur] > 1:
-                parents = parent_sets[s][cur]
-                if not parents:
-                    break
-                cur = next(iter(parents))   # deterministic: same graph same result
-            path_mid[s, v] = cur
+            if visited_dist[v] >= 2:
+                path_mid[s, v] = first_hop[v]
 
     return {
         "dist_int": dist_int,
@@ -123,10 +115,10 @@ def _compute_path_features_single(adj: np.ndarray, max_hops: int = 40) -> Dict[s
 # ---------------------------------------------------------------------------
 
 def precompute_path_features(dataset, cache_dir: str, max_hops: int = 40,
-                              num_workers: int = 8):
+                             num_workers: int = 8):
     """Compute and cache path feature arrays for every graph in *dataset*.
 
-    The cache is keyed by ``max_hops``.  If the cache already exists it is
+    The cache is keyed by ``max_hops``. If the cache already exists it is
     loaded directly without recomputation.
 
     Returns
@@ -169,9 +161,9 @@ def precompute_path_features(dataset, cache_dir: str, max_hops: int = 40,
             adj[ei[1], ei[0]] = 1.0   # undirected
         adjs.append(adj)
 
-    compute_fn = partial(_compute_path_features_single, max_hops=max_hops)
-    with Pool(min(num_workers, max(len(adjs), 1))) as p:
-        features = p.map(compute_fn, adjs)
+    features = []
+    for adj in tqdm(adjs, desc="  [HopMasked] Path features", ncols=80):
+        features.append(_compute_path_features_single(adj, max_hops=max_hops))
 
     os.makedirs(cache_dir, exist_ok=True)
     with open(cache_path, "wb") as f:
