@@ -219,6 +219,19 @@ def build_parser():
                         "to compute for RRWP bias. Only used when --use_rrwp "
                         "is set.")
 
+    # MERW Path Aggregation
+    p.add_argument("--use_merw", action="store_true", default=False,
+                   help="Sample MERW paths and enrich node features using PathNet-style "
+                        "sequence and distance encoding.")
+    p.add_argument("--merw_num_paths", type=int, default=20,
+                   help="Number of MERW random walk paths sampled per node (default: 20).")
+    p.add_argument("--merw_path_len", type=int, default=3,
+                   help="Length of MERW paths in edges (default: 3 -> 4 nodes).")
+    p.add_argument("--merw_merge", type=str, default="concat",
+                   choices=["concat", "conv", "cross_attn"],
+                   help="Method to merge the 4-step path token sequence into 1 vector: "
+                        "'concat' (Concat+MLP), 'conv' (1D Causal Conv), or 'cross_attn' (Local Query Attention).")
+
     # Hop-to-head assignment
     p.add_argument("--hop_mode", type=str, default="contiguous",
                    choices=["contiguous", "window", "single", "interleaved",
@@ -304,8 +317,12 @@ def parse_args():
 
 
 def _move_batch_to_device(batch, device):
+    if len(batch) == 5:
+        pyg_batch, dist_masks, node_masks, merw_paths, merw_dists = batch
+        return (pyg_batch.to(device), dist_masks.to(device), node_masks.to(device),
+                merw_paths.to(device), merw_dists.to(device))
     pyg_batch, dist_masks, node_masks = batch
-    return pyg_batch.to(device), dist_masks.to(device), node_masks.to(device)
+    return pyg_batch.to(device), dist_masks.to(device), node_masks.to(device), None, None
 
 
 def run_epoch(model, loader, task, device, optimizer=None, scheduler=None,
@@ -331,12 +348,13 @@ def run_epoch(model, loader, task, device, optimizer=None, scheduler=None,
 
     losses, preds_acc, labels_acc = [], [], []
     for batch in loader:
-        pyg_batch, dist_masks, node_masks = _move_batch_to_device(batch, device)
+        pyg_batch, dist_masks, node_masks, merw_paths, merw_dists = _move_batch_to_device(batch, device)
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
             logits, _, aux_loss, gw = model(
                 pyg_batch, dist_masks, node_masks,
+                merw_paths=merw_paths, merw_dists=merw_dists,
                 return_gate_weights=_do_collect,
             )
             task_loss = task.loss(logits, pyg_batch.y)
@@ -498,6 +516,9 @@ def main():
         egonet_max_nodes=args.egonet_max_nodes,
         max_egonet_samples=args.max_egonet_samples,
         seed=args.seed,
+        use_merw=args.use_merw,
+        merw_num_paths=args.merw_num_paths,
+        merw_path_len=args.merw_path_len,
     )
     dataset_name = dataset_info["name"]
 
@@ -574,7 +595,11 @@ def main():
         multihop_attn=args.multihop_attn,
         multihop_readout=args.multihop_readout,
         multihop_include_global=not args.multihop_no_global,
-        embed_dropout=args.dropout
+        embed_dropout=args.dropout,
+        use_merw=args.use_merw,
+        merw_num_paths=args.merw_num_paths,
+        merw_path_len=args.merw_path_len,
+        merw_merge=args.merw_merge,
     ).to(args.device)
 
     # Print the head -> hop-set assignment so it's logged for reproducibility.

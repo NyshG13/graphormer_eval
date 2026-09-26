@@ -602,6 +602,145 @@ class DynamicCrossHopMixer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MERW Path Encoder: Sequence & distance preserving path aggregation.
+# ---------------------------------------------------------------------------
+class MERWPathEncoder(nn.Module):
+    """Encodes sampled MERW paths and enriches node feature vectors.
+
+    Supports 3 path merging methods:
+      1. 'concat': Concatenate the sequence of tokens and project via Linear(seq_len * d -> d).
+      2. 'conv': 1D Causal Convolution along the sequence length axis.
+      3. 'cross_attn': Target node query cross-attends over its path tokens.
+
+    Then, target node embedding attends over its M encoded paths via Path-Level Attention.
+    """
+    def __init__(
+        self,
+        hidden_dim: int,
+        path_len: int = 3,
+        num_paths: int = 20,
+        max_hops: int = 40,
+        merge_mode: str = "concat",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.path_len = path_len
+        self.seq_len = path_len + 1  # e.g., 4 tokens for path_len=3
+        self.num_paths = num_paths
+        self.merge_mode = merge_mode
+        self.scale = hidden_dim ** -0.5
+
+        # 1. Step positional embedding (step in walk: 0, 1, 2, 3...)
+        self.step_embed = nn.Embedding(self.seq_len + 1, hidden_dim)
+        # 2. Distance-to-target embedding (SPD d: 0, 1, 2, ...)
+        self.dist_embed = nn.Embedding(max_hops + 1, hidden_dim)
+
+        # 3. Path-merging mechanism
+        if merge_mode == "concat":
+            self.path_mlp = nn.Sequential(
+                nn.Linear(self.seq_len * hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        elif merge_mode == "conv":
+            # Causal 1D Convolution over seq_len
+            self.conv = nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2),
+            )
+        elif merge_mode == "cross_attn":
+            self.local_q_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.local_k_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.local_v_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.local_drop = nn.Dropout(dropout)
+        else:
+            raise ValueError(f"Unknown path merge mode: {merge_mode}")
+
+        self.path_norm = nn.LayerNorm(hidden_dim)
+
+        # 4. Path-to-Node Attention Aggregator
+        self.node_q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.path_k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.path_v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.attn_drop = nn.Dropout(dropout)
+        self.final_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        dense_x: torch.Tensor,     # (B, N, d)
+        merw_paths: torch.Tensor,  # (B, N, M, seq_len) int64
+        merw_dists: torch.Tensor,  # (B, N, M, seq_len) int64
+        node_mask: Optional[torch.Tensor] = None, # (B, N) bool
+    ) -> torch.Tensor:
+        B, N, d = dense_x.shape
+        M, seq_len = self.num_paths, self.seq_len
+
+        # Clamp paths to valid range [0, N-1]
+        clamped_paths = merw_paths.clamp(min=0, max=N - 1)  # (B, N, M, seq_len)
+
+        # Gather node embeddings along paths: (B, N*M*seq_len, d)
+        flat_idx = clamped_paths.view(B, N * M * seq_len, 1).expand(-1, -1, d)
+        gathered = torch.gather(dense_x, 1, flat_idx)
+        tokens = gathered.view(B, N, M, seq_len, d)  # (B, N, M, seq_len, d)
+
+        # Step positional embeddings: (1, 1, 1, seq_len, d)
+        step_idx = torch.arange(seq_len, device=dense_x.device).view(1, 1, 1, seq_len)
+        step_pos = self.step_embed(step_idx)
+
+        # Distance embeddings: (B, N, M, seq_len, d)
+        dist_clamped = merw_dists.clamp(min=0, max=self.dist_embed.num_embeddings - 1)
+        dist_emb = self.dist_embed(dist_clamped)
+
+        tokens = tokens + step_pos + dist_emb  # (B, N, M, seq_len, d)
+
+        # -------------------------------------------------------------
+        # 1. Merge the seq_len-step sequence into 1 vector per path (B, N, M, d)
+        # -------------------------------------------------------------
+        if self.merge_mode == "concat":
+            flat_tokens = tokens.view(B, N, M, seq_len * d)
+            h_paths = self.path_mlp(flat_tokens)  # (B, N, M, d)
+        elif self.merge_mode == "conv":
+            # (B*N*M, d, seq_len)
+            conv_in = tokens.view(B * N * M, seq_len, d).transpose(1, 2)
+            conv_out = self.conv(conv_in)[:, :, :seq_len]  # truncate causal padding
+            h_paths = conv_out[:, :, -1].view(B, N, M, d)  # take final step
+        elif self.merge_mode == "cross_attn":
+            # Query = root node token at step 0: (B, N, M, 1, d)
+            q_tok = self.local_q_proj(tokens[:, :, :, 0:1, :])
+            k_tok = self.local_k_proj(tokens)  # (B, N, M, seq_len, d)
+            v_tok = self.local_v_proj(tokens)  # (B, N, M, seq_len, d)
+            local_scores = torch.matmul(q_tok, k_tok.transpose(-2, -1)) * self.scale  # (B, N, M, 1, seq_len)
+            local_attn = F.softmax(local_scores, dim=-1)
+            local_attn = self.local_drop(local_attn)
+            h_paths = torch.matmul(local_attn, v_tok).squeeze(-2)  # (B, N, M, d)
+
+        h_paths = self.path_norm(h_paths)
+
+        # -------------------------------------------------------------
+        # 2. Path-to-Node Attention Aggregator
+        # Target node attends over its M candidate paths
+        # -------------------------------------------------------------
+        q_node = self.node_q_proj(dense_x).unsqueeze(2)     # (B, N, 1, d)
+        k_path = self.path_k_proj(h_paths)                  # (B, N, M, d)
+        v_path = self.path_v_proj(h_paths)                  # (B, N, M, d)
+
+        scores = torch.matmul(q_node, k_path.transpose(-2, -1)) * self.scale  # (B, N, 1, M)
+        attn_weights = F.softmax(scores, dim=-1)            # (B, N, 1, M)
+        attn_weights = self.attn_drop(attn_weights)
+
+        x_path = torch.matmul(attn_weights, v_path).squeeze(2)  # (B, N, d)
+
+        out = self.final_norm(dense_x + x_path)
+        if node_mask is not None:
+            out = out * node_mask.unsqueeze(-1).to(out.dtype)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Hop-masked multi-head attention.
 # ---------------------------------------------------------------------------
 class HopMaskedMHA(nn.Module):
@@ -1326,6 +1465,10 @@ class HopMaskedTransformerModel(nn.Module):
         multihop_readout: str = "sum",
         multihop_include_global: bool = True,
         embed_dropout: float = 0.0,
+        use_merw: bool = False,
+        merw_num_paths: int = 20,
+        merw_path_len: int = 3,
+        merw_merge: str = "concat",
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -1355,6 +1498,22 @@ class HopMaskedTransformerModel(nn.Module):
         self.use_edge_bias = use_edge_bias
         self.use_rrwp = use_rrwp
         self.rrwp_dim = rrwp_dim
+        self.use_merw = use_merw
+        self.merw_num_paths = merw_num_paths
+        self.merw_path_len = merw_path_len
+        self.merw_merge = merw_merge
+
+        self.merw_path_encoder = None
+        if use_merw:
+            self.merw_path_encoder = MERWPathEncoder(
+                hidden_dim=hidden_dim,
+                path_len=merw_path_len,
+                num_paths=merw_num_paths,
+                max_hops=max_hops,
+                merge_mode=merw_merge,
+                dropout=dropout,
+            )
+
         # (#3) Post-encoder embedding dropout — applied once after the node
         # encoder and before the first transformer layer.  Separate from the
         # per-sublayer ``dropout`` so it can be tuned independently.
@@ -1809,6 +1968,8 @@ class HopMaskedTransformerModel(nn.Module):
         return to_dense_batch(h, batch.batch)
 
     def forward(self, batch, dist_masks, node_masks,
+                merw_paths: Optional[torch.Tensor] = None,
+                merw_dists: Optional[torch.Tensor] = None,
                 return_gate_weights: bool = False):
         """Forward pass.
 
@@ -1822,6 +1983,8 @@ class HopMaskedTransformerModel(nn.Module):
             loop without gradient overhead.
         """
         dense_x, dense_mask = self.encode_dense(batch)
+        if self.use_merw and self.merw_path_encoder is not None and merw_paths is not None and merw_dists is not None:
+            dense_x = self.merw_path_encoder(dense_x, merw_paths, merw_dists, dense_mask)
         # (#3) Post-encoder embedding dropout.
         dense_x = self.embed_drop(dense_x)
         nm = node_masks if node_masks is not None else dense_mask
