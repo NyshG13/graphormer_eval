@@ -864,8 +864,11 @@ def _collect_per_sample_data(model, loader, task, device):
     y_preds = []
 
     for batch in loader:
-        pyg_batch, dist_masks, node_masks = _move_batch_to_device(batch, device)
-        logits, _, aux_loss, _gw = model(pyg_batch, dist_masks, node_masks)
+        pyg_batch, dist_masks, node_masks, merw_paths, merw_dists = _move_batch_to_device(batch, device)
+        logits, _, aux_loss, _gw = model(
+            pyg_batch, dist_masks, node_masks,
+            merw_paths=merw_paths, merw_dists=merw_dists
+        )
 
         # --- Per-sample loss (unreduced) ---
         if task.task_type == "multi_label":
