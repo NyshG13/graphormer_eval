@@ -362,6 +362,14 @@ def run_epoch(model, loader, task, device, optimizer=None, scheduler=None,
 
         if is_train:
             loss.backward()
+            # Track MERW path encoder gradient norm
+            if getattr(model, "merw_path_encoder", None) is not None:
+                tot_sq = 0.0
+                for p in model.merw_path_encoder.parameters():
+                    if p.grad is not None:
+                        tot_sq += p.grad.detach().data.norm(2).item() ** 2
+                model.merw_path_encoder._last_grad_norm = tot_sq ** 0.5
+
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
@@ -403,6 +411,18 @@ def _log_head_stats(epoch, model, gate_weights_mean, args):
         With multiple layers each layer's gammas are shown separately.
     """
     prefix = f"[epoch {epoch:03d}]"
+
+    # ── MERW Path Diagnostics ────────────────────────────────────────────────
+    merw_enc = getattr(model, "merw_path_encoder", None)
+    if merw_enc is not None and getattr(merw_enc, "_diag", None) is not None:
+        md = merw_enc._diag
+        m_grad = getattr(merw_enc, "_last_grad_norm", 0.0)
+        print(f"{prefix} MERW Path Diagnostics: "
+              f"attn_ent={md['entropy']:.3f} "
+              f"part={md['participation']:.2f}/{merw_enc.num_paths} "
+              f"top_path={md['top_path']:.3f} "
+              f"gate_alpha={md['gate']:.4f} "
+              f"grad_norm={m_grad:.4f}", flush=True)
 
     # ── Attention diagnostics ─────────────────────────────────────────────────
     # Populated only when set_attn_diagnostics(True) was active during the

@@ -668,6 +668,10 @@ class MERWPathEncoder(nn.Module):
         self.path_v_proj = nn.Linear(hidden_dim, hidden_dim)
         self.attn_drop = nn.Dropout(dropout)
         self.final_norm = nn.LayerNorm(hidden_dim)
+        # Learnable residual gate initialized to 0.0 so original node embeddings
+        # are 100% preserved initially and path features are smoothly blended in.
+        self.path_gate = nn.Parameter(torch.tensor(0.0))
+        self._diag = None
 
     def forward(
         self,
@@ -700,6 +704,7 @@ class MERWPathEncoder(nn.Module):
         # -------------------------------------------------------------
         # 1. Merge the seq_len-step sequence into 1 vector per path (B, N, M, d)
         # -------------------------------------------------------------
+        root_token = tokens[:, :, :, 0, :]  # (B, N, M, d) target node at step 0
         if self.merge_mode == "concat":
             flat_tokens = tokens.view(B, N, M, seq_len * d)
             h_paths = self.path_mlp(flat_tokens)  # (B, N, M, d)
@@ -718,7 +723,8 @@ class MERWPathEncoder(nn.Module):
             local_attn = self.local_drop(local_attn)
             h_paths = torch.matmul(local_attn, v_tok).squeeze(-2)  # (B, N, M, d)
 
-        h_paths = self.path_norm(h_paths)
+        # Explicit residual: add root node token to preserve original node representation
+        h_paths = self.path_norm(h_paths + root_token)
 
         # -------------------------------------------------------------
         # 2. Path-to-Node Attention Aggregator
@@ -729,12 +735,37 @@ class MERWPathEncoder(nn.Module):
         v_path = self.path_v_proj(h_paths)                  # (B, N, M, d)
 
         scores = torch.matmul(q_node, k_path.transpose(-2, -1)) * self.scale  # (B, N, 1, M)
-        attn_weights = F.softmax(scores, dim=-1)            # (B, N, 1, M)
-        attn_weights = self.attn_drop(attn_weights)
+        raw_attn = F.softmax(scores, dim=-1)                # (B, N, 1, M)
+        attn_weights = self.attn_drop(raw_attn)
+
+        # Stash detached diagnostics
+        with torch.no_grad():
+            p = raw_attn.squeeze(2).clamp_min(1e-12)        # (B, N, M)
+            ent = -(p * p.log()).sum(-1)                    # (B, N)
+            part = 1.0 / p.pow(2).sum(-1).clamp_min(1e-12)  # (B, N)
+            if node_mask is not None:
+                valid = node_mask
+            else:
+                valid = torch.ones(B, N, dtype=torch.bool, device=dense_x.device)
+            if valid.any():
+                ent_val = float(ent[valid].mean().cpu())
+                part_val = float(part[valid].mean().cpu())
+                top_p_val = float(p.max(dim=-1)[0][valid].mean().cpu())
+            else:
+                ent_val = float(ent.mean().cpu())
+                part_val = float(part.mean().cpu())
+                top_p_val = float(p.max(dim=-1)[0].mean().cpu())
+            self._diag = {
+                "entropy": ent_val,
+                "participation": part_val,
+                "top_path": top_p_val,
+                "gate": float(self.path_gate.detach().cpu()),
+            }
 
         x_path = torch.matmul(attn_weights, v_path).squeeze(2)  # (B, N, d)
 
-        out = self.final_norm(dense_x + x_path)
+        # Preserve original node embeddings as base residual + gated path features
+        out = dense_x + self.path_gate * self.final_norm(x_path)
         if node_mask is not None:
             out = out * node_mask.unsqueeze(-1).to(out.dtype)
         return out
