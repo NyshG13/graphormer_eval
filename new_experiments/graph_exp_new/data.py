@@ -4,6 +4,20 @@ import pickle
 import numpy as np
 import torch
 import torch_geometric
+
+# PyG 2.4+ InMemoryDataset saves (data, slices, sizes) (3-tuple).
+# Older LRGBDataset unpacks as `self.data, self.slices = torch.load(path)` (expects 2-tuple).
+# Wrap torch.load so loading PyG datasets unpacks cleanly.
+_orig_torch_load = torch.load
+
+def _safe_torch_load(*args, **kwargs):
+    res = _orig_torch_load(*args, **kwargs)
+    if isinstance(res, tuple) and len(res) > 2:
+        return res[:2]
+    return res
+
+torch.load = _safe_torch_load
+
 from torch_geometric.datasets import LRGBDataset, GNNBenchmarkDataset, ZINC
 from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import Compose
