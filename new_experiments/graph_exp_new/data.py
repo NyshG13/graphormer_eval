@@ -5,15 +5,20 @@ import numpy as np
 import torch
 import torch_geometric
 
-# PyG 2.4+ InMemoryDataset saves (data, slices, sizes) (3-tuple).
-# Older LRGBDataset unpacks as `self.data, self.slices = torch.load(path)` (expects 2-tuple).
-# Wrap torch.load so loading PyG datasets unpacks cleanly.
+# PyG 2.4+ InMemoryDataset saves (data.to_dict(), slices, sizes) (3-tuple).
+# Older LRGBDataset unpacks as `self.data, self.slices = torch.load(path)` (expects 2-tuple Data object).
+# Wrap torch.load so loading PyG datasets unpacks cleanly as Data objects.
 _orig_torch_load = torch.load
 
 def _safe_torch_load(*args, **kwargs):
     res = _orig_torch_load(*args, **kwargs)
-    if isinstance(res, tuple) and len(res) > 2:
-        return res[:2]
+    if isinstance(res, tuple) and len(res) >= 2:
+        data = res[0]
+        slices = res[1]
+        if isinstance(data, dict):
+            from torch_geometric.data import Data
+            data = Data.from_dict(data)
+        return (data, slices)
     return res
 
 torch.load = _safe_torch_load
@@ -890,8 +895,14 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
 
     def _build_dataset(split):
         if source == "lrgb":
-            return LRGBDataset(root="./data", name=pyg_name, split=split,
+            ds = LRGBDataset(root="./data", name=pyg_name, split=split,
                                transform=transform)
+            from torch_geometric.data import Data
+            if hasattr(ds, "_data") and isinstance(ds._data, dict):
+                ds._data = Data.from_dict(ds._data)
+            if hasattr(ds, "data") and isinstance(ds.data, dict):
+                ds.data = Data.from_dict(ds.data)
+            return ds
         if source == "gnn_benchmark":
             return GNNBenchmarkDataset(root="./data", name=pyg_name, split=split,
                                        transform=transform)
