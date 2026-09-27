@@ -332,11 +332,12 @@ class HopMaskedTransformerModelEdgeMERW(nn.Module):
         )
 
         # Transformer layers
+        ffn_dim = int(hidden_dim * ffn_ratio)
         self.layers = nn.ModuleList([
             HopMaskedTransformerLayer(
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
-                ffn_ratio=ffn_ratio,
+                ffn_dim=ffn_dim,
                 dropout=dropout,
                 max_hops=max_hops,
                 block_diag_out=block_diag_out,
@@ -346,7 +347,7 @@ class HopMaskedTransformerModelEdgeMERW(nn.Module):
                 use_moe_gating=use_moe_gating,
                 top_k=top_k,
                 gate_noise=gate_noise,
-                hop_membership=None,
+                cross_hop_membership=None,
                 cross_hop_no_ffn=cross_hop_no_ffn,
                 blend_adj_power=blend_adj_power,
                 use_edge_bias=use_edge_bias,
