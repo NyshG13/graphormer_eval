@@ -407,16 +407,18 @@ class HopMaskedTransformerModelEdgeMERW(nn.Module):
 
         x = self.norm(x)
 
-        if self.task_level == "graph":
-            if self.graph_pool == "mean":
-                mask_f = nm.unsqueeze(-1).float()
-                graph_emb = (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
-            else:
-                graph_emb = (x * nm.unsqueeze(-1)).sum(dim=1)
-            logits = self.head(graph_emb)
-            node_emb = x
+        if self.task_level == "node":
+            node_emb = x[nm]
+            logits = self.head(node_emb)
+            return logits, node_emb, aux_loss, _exported_gw
+
+        # Graph-level pooling
+        if self.graph_pool == "mean":
+            mask_f = nm.unsqueeze(-1).float()
+            graph_emb = (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
         else:
-            logits = self.head(x)
-            node_emb = x
+            graph_emb = (x * nm.unsqueeze(-1)).sum(dim=1)
+        logits = self.head(graph_emb)
+        node_emb = x
 
         return logits, node_emb, aux_loss, _exported_gw
