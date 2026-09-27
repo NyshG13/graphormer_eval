@@ -132,12 +132,14 @@ class MERWPathEdgeEncoder(nn.Module):
         E_dense[edge_batch[valid_edges], src_local[valid_edges], dst_local[valid_edges]] = edge_emb[valid_edges]
 
         # 3. Look up the L edges for all M sampled walks: [v0->v1, v1->v2, ..., vL-1->vL]
-        clamped_paths = merw_paths.clamp(min=0, max=N - 1)  # (B, N, M, L+1)
-        src_nodes = clamped_paths[:, :, :, :-1]             # (B, N, M, L)
-        dst_nodes = clamped_paths[:, :, :, 1:]              # (B, N, M, L)
+        clamped_paths = merw_paths.clamp(min=0, max=N - 1)
+        L = min(self.path_len, clamped_paths.shape[-1] - 1)
+        src_nodes = clamped_paths[:, :, :, :L]             # (B, N, M, L)
+        dst_nodes = clamped_paths[:, :, :, 1:L+1]          # (B, N, M, L)
 
         b_idx = torch.arange(B, device=dense_x.device).view(B, 1, 1, 1).expand(B, N, M, L)
         edge_tokens = E_dense[b_idx, src_nodes, dst_nodes]  # (B, N, M, L, d)
+        del E_dense, b_idx
 
         # 4. Add step positional embeddings for transitions 0..L-1
         step_idx = torch.arange(L, device=dense_x.device).view(1, 1, 1, L)
