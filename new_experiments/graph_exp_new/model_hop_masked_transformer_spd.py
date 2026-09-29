@@ -57,7 +57,7 @@ class SPDGeodesicBias(nn.Module):
         unreachable = 1.0 - reachable                                                # (B, 1, N, N)
 
         # Vectorized tensor contraction for all reachable distances
-        spd_bias = torch.einsum("bknn,kh->bhnn", dist_masks[:, :K_eff], self.spd_bias_emb.weight[:K_eff])
+        spd_bias = torch.einsum("bknm,kh->bhnm", dist_masks[:, :K_eff], self.spd_bias_emb.weight[:K_eff])
 
         # Add unreachable / infinity distance bias
         spd_bias = spd_bias + unreachable * self.spd_bias_emb.weight[self.max_hops].view(1, H, 1, 1)
@@ -440,7 +440,6 @@ class HopMaskedTransformerModelSPD(nn.Module):
                 blend_adj_power=blend_adj_power,
                 use_edge_bias=use_edge_bias or use_spd_bias,
                 use_rrwp=use_rrwp,
-                rrwp_dim=rrwp_dim,
             )
             for _ in range(num_layers)
         ])
@@ -506,7 +505,10 @@ class HopMaskedTransformerModelSPD(nn.Module):
         spd_paths: Optional[torch.Tensor] = None,
         spd_dists: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        h = self.node_encoder(batch)
+        lap_pe = getattr(batch, "lap_pe", None)
+        edge_attr = getattr(batch, "edge_attr", None)
+        edge_index = getattr(batch, "edge_index", None)
+        h = self.node_encoder(batch.x, edge_index, edge_attr, lap_pe=lap_pe)
         dense_x, mask = to_dense_batch(h, batch.batch)
         if node_mask is None:
             node_mask = mask
