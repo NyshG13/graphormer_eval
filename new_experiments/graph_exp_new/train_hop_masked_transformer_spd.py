@@ -206,31 +206,34 @@ def main():
     # Use MERW/SPD loader when sequence paths are enabled
     use_path_loader = args.use_spd_path or args.use_spd_edge_path
 
-    train_loader, val_loader, test_loader, dataset_info = get_loaders(
-        dataset_name=args.dataset,
-        max_hops=args.max_hops,
+    train_loader, val_loader, test_loader, _, _, _, dataset_info = get_loaders(
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        use_dist_masks=True,
+        max_hops=args.max_hops,
+        dist_mask_workers=args.dist_mask_workers,
+        use_lap_pe=args.use_lap_pe,
+        lap_pe_dim=args.lap_pe_dim,
+        dataset_name=args.dataset,
+        return_info=True,
         subgraph_mode=args.subgraph_mode,
         num_parts=args.num_parts,
         egonet_hops=args.egonet_hops,
         egonet_max_nodes=args.egonet_max_nodes,
         max_egonet_samples=args.max_egonet_samples,
-        use_lap_pe=args.use_lap_pe,
-        lap_pe_dim=args.lap_pe_dim,
-        mask_type=args.mask_type,
-        adj_self_loops=args.adj_self_loops,
-        num_workers=args.num_workers,
-        dist_mask_workers=args.dist_mask_workers,
+        seed=args.seed,
         use_merw=use_path_loader,
         merw_num_paths=args.spd_num_paths,
         merw_path_len=args.spd_path_len,
     )
+    dataset_name = dataset_info["name"]
 
     pos_weight = None
     if args.use_pos_weight:
         pos_weight = compute_pos_weight(train_loader).to(args.device)
 
     task = build_task(
+        dataset_name,
         dataset_info=dataset_info,
         pos_weight=pos_weight,
         focal_gamma=args.focal_gamma,
