@@ -409,46 +409,40 @@ class HopMaskedTransformerModelSPD(nn.Module):
 
         if self.use_alternating:
             self.per_layer_hop_sets = _build_alternating_hop_sets(
-                num_heads=num_heads, max_hops=max_hops,
+                max_hops=max_hops, num_heads=num_heads,
                 num_layers=num_layers, num_global_heads=num_global_heads,
             )
             self.head_hop_sets = self.per_layer_hop_sets[0]
         else:
             self.head_hop_sets = build_head_hop_sets(
-                num_heads=num_heads, max_hops=max_hops,
-                mode=hop_mode, hop_window=hop_window,
+                max_hops=max_hops, num_heads=num_heads,
+                mode=hop_mode, window=hop_window,
                 hop_file=hop_file, num_global_heads=num_global_heads,
             )
 
+        ffn_dim = int(hidden_dim * ffn_ratio)
         self.layers = nn.ModuleList([
             HopMaskedTransformerLayer(
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
-                ffn_ratio=ffn_ratio,
+                ffn_dim=ffn_dim,
                 dropout=dropout,
-                max_hops=max_hops,
-                hop_mode=hop_mode,
-                hop_window=hop_window,
-                hop_file=hop_file,
-                num_global_heads=num_global_heads,
                 block_diag_out=block_diag_out,
                 dynamic_cross_hop=dynamic_cross_hop,
                 norm_type=norm_type,
                 v_head_dim=v_head_dim,
                 use_moe_gating=use_moe_gating,
+                max_hops=max_hops,
                 top_k=top_k,
                 gate_noise=gate_noise,
-                balance_coeff=balance_coeff,
-                entropy_coeff=entropy_coeff,
                 cross_hop_hop_embedding=cross_hop_hop_embedding,
                 cross_hop_no_ffn=cross_hop_no_ffn,
                 blend_adj_power=blend_adj_power,
                 use_edge_bias=use_edge_bias or use_spd_bias,
                 use_rrwp=use_rrwp,
                 rrwp_dim=rrwp_dim,
-                layer_idx=i,
             )
-            for i in range(num_layers)
+            for _ in range(num_layers)
         ])
 
         self.post_gat = None
@@ -469,6 +463,33 @@ class HopMaskedTransformerModelSPD(nn.Module):
             )
         else:
             self.head = nn.Linear(hidden_dim, output_dim)
+
+    def _build_per_head_mask(
+        self,
+        dist_masks: torch.Tensor,
+        hop_sets: Optional[List[Optional[List[int]]]] = None,
+    ) -> torch.Tensor:
+        B, K_runtime, N, _ = dist_masks.shape
+        H = self.num_heads
+        if hop_sets is None:
+            hop_sets = self.head_hop_sets
+        out = dist_masks.new_zeros(B, H, N, N, dtype=torch.bool)
+        for h, hop_set in enumerate(hop_sets):
+            if hop_set is None:
+                out[:, h] = True
+                continue
+            idx = [k for k in hop_set if k < K_runtime]
+            if not idx:
+                out[:, h] = True
+                continue
+            stacked = dist_masks[:, idx].bool().any(dim=1)
+            out[:, h] = stacked
+
+        eye = torch.eye(N, device=dist_masks.device, dtype=torch.bool)
+        non_self = out & ~eye[None, None]
+        has_nonself = non_self.any(dim=-1).any(dim=-1)
+        out[~has_nonself] = True
+        return out
 
     def get_path_diagnostics(self):
         if self.spd_edge_encoder is not None:
@@ -503,11 +524,13 @@ class HopMaskedTransformerModelSPD(nn.Module):
         if self.use_spd_bias and self.spd_bias_module is not None:
             spd_bias = self.spd_bias_module(dist_masks)
 
-        # Pass through Transformer Stack
-        for layer in self.layers:
+        # Pass through Transformer Stack with per-head masks
+        for i, layer in enumerate(self.layers):
+            hop_sets = self.per_layer_hop_sets[i] if self.use_alternating else None
+            per_head_mask = self._build_per_head_mask(dist_masks, hop_sets=hop_sets)
             dense_x = layer(
                 dense_x,
-                dist_masks,
+                per_head_mask,
                 node_mask=node_mask,
                 edge_bias=spd_bias,
             )
