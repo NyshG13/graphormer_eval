@@ -289,11 +289,11 @@ def main():
     total_steps = max(args.max_epochs * len(train_loader), 1)
     optimizer, scheduler = build_grouped_optimizer_and_scheduler(
         named_parameters=list(model.named_parameters()),
-        base_lr=args.lr,
+        lr_max=args.lr,
+        lr_min=args.lr_min,
         weight_decay=args.weight_decay,
         total_steps=total_steps,
         warmup_ratio=args.warmup_ratio,
-        lr_min=args.lr_min,
     )
 
     best_val_metric = -float("inf")
