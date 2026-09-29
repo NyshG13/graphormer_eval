@@ -165,11 +165,16 @@ def train_one_epoch(model, loader, optimizer, scheduler, task, device, grad_clip
         total_loss += float(task_loss.item())
         n_batches += 1
 
-        all_preds.append(logits.detach().cpu())
-        all_targets.append(pyg_batch.y.detach().cpu())
+        all_preds.append(task.predict(logits))
+        all_targets.append(task.labels_to_numpy(pyg_batch.y))
 
-    metric_val = task.compute_metric(all_preds, all_targets)
-    return total_loss / max(n_batches, 1), metric_val
+    if len(all_preds) > 0:
+        y_pred = np.concatenate(all_preds, axis=0)
+        y_true = np.concatenate(all_targets, axis=0)
+        metric_val = task.compute_metric(y_pred, y_true)
+    else:
+        metric_val = 0.0
+    return total_loss / max(n_batches, 1), float(metric_val)
 
 
 @torch.no_grad()
@@ -192,11 +197,16 @@ def evaluate(model, loader, task, device):
         total_loss += float(task_loss.item())
         n_batches += 1
 
-        all_preds.append(logits.detach().cpu())
-        all_targets.append(pyg_batch.y.detach().cpu())
+        all_preds.append(task.predict(logits))
+        all_targets.append(task.labels_to_numpy(pyg_batch.y))
 
-    metric_val = task.compute_metric(all_preds, all_targets)
-    return total_loss / max(n_batches, 1), metric_val
+    if len(all_preds) > 0:
+        y_pred = np.concatenate(all_preds, axis=0)
+        y_true = np.concatenate(all_targets, axis=0)
+        metric_val = task.compute_metric(y_pred, y_true)
+    else:
+        metric_val = 0.0
+    return total_loss / max(n_batches, 1), float(metric_val)
 
 
 def main():

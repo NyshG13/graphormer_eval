@@ -538,15 +538,14 @@ class HopMaskedTransformerModelSPD(nn.Module):
             )
 
         if self.task_level == "node":
-            out_flat = dense_x[node_mask]
+            out_flat = dense_x[mask]
             if self.post_gat is not None:
                 out_flat = self.post_gat(out_flat, batch.edge_index)
             return self.head(out_flat)
 
+        mask_f = mask.unsqueeze(-1).float()
         if self.graph_pool == "mean":
-            mask_f = node_mask.unsqueeze(-1).float()
             g_emb = (dense_x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
         else:
-            mask_f = node_mask.unsqueeze(-1).float()
             g_emb = (dense_x * mask_f).sum(dim=1)
         return self.head(g_emb)
