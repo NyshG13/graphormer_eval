@@ -255,7 +255,6 @@ dependencies:
       - pycparser==2.21
       - pydot==1.4.2
       - pygments==2.16.1
-      - pygraphviz==1.12
       - pygsp==0.5.1
       - pymongo==3.13.0
       - pytest==7.4.2

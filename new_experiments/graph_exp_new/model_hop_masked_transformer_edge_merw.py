@@ -38,6 +38,7 @@ class MERWPathEdgeEncoder(nn.Module):
         hidden_dim: int,
         path_len: int = 3,
         num_paths: int = 20,
+        max_hops: int = 40,
         merge_mode: str = "concat",
         dropout: float = 0.0,
         dataset_name: str = "PascalVOC-SP",
@@ -47,6 +48,7 @@ class MERWPathEdgeEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.path_len = path_len       # Number of edges in walk (e.g. 3 for 4-node path)
         self.num_paths = num_paths     # Number of sampled paths per node (e.g. 20)
+        self.max_hops = max_hops
         self.merge_mode = merge_mode
         self.scale = hidden_dim ** -0.5
 
@@ -55,8 +57,9 @@ class MERWPathEdgeEncoder(nn.Module):
             hidden_dim, dataset_name=dataset_name, edge_feat_dim=edge_feat_dim
         )
 
-        # 2. Step positional embedding for edge transitions (step 1, step 2, ... step L)
+        # 2. Step positional embedding & Distance embedding for edge transitions
         self.step_embed = nn.Embedding(self.path_len + 1, hidden_dim)
+        self.dist_embed = nn.Embedding(max_hops + 1, hidden_dim)
 
         # 3. Path-merging mechanism (maps L * d -> d)
         if merge_mode == "concat":
@@ -100,6 +103,7 @@ class MERWPathEdgeEncoder(nn.Module):
         merw_paths: torch.Tensor,  # (B, N, M, path_len + 1) node indices in walk
         batch: torch_geometric.data.Batch,
         node_mask: Optional[torch.Tensor] = None, # (B, N) bool
+        merw_dists: Optional[torch.Tensor] = None, # (B, N, M, path_len + 1)
     ) -> torch.Tensor:
         B, N, d = dense_x.shape
         M, L = self.num_paths, self.path_len
@@ -141,10 +145,15 @@ class MERWPathEdgeEncoder(nn.Module):
         edge_tokens = E_dense[b_idx, src_nodes, dst_nodes]  # (B, N, M, L, d)
         del E_dense, b_idx
 
-        # 4. Add step positional embeddings for transitions 0..L-1
+        # 4. Add step positional embeddings & distance embeddings for transitions 0..L-1
         step_idx = torch.arange(L, device=dense_x.device).view(1, 1, 1, L)
         step_pos = self.step_embed(step_idx)
         edge_tokens = edge_tokens + step_pos                # (B, N, M, L, d)
+
+        if merw_dists is not None:
+            clamped_dists = merw_dists[:, :, :, 1:L+1].clamp(min=0, max=self.max_hops)
+            dist_pos = self.dist_embed(clamped_dists)
+            edge_tokens = edge_tokens + dist_pos
 
         # 5. Merge the L edge tokens into 1 vector per path (B, N, M, d)
         if self.merge_mode == "concat":
@@ -299,6 +308,7 @@ class HopMaskedTransformerModelEdgeMERW(nn.Module):
                 hidden_dim=hidden_dim,
                 path_len=merw_path_len,
                 num_paths=merw_num_paths,
+                max_hops=max_hops,
                 merge_mode=merw_merge,
                 dropout=dropout,
                 dataset_name=dataset_name,
@@ -377,7 +387,7 @@ class HopMaskedTransformerModelEdgeMERW(nn.Module):
 
         # Apply Edge-based MERW enrichment
         if self.use_merw and self.merw_path_encoder is not None and merw_paths is not None:
-            dense_x = self.merw_path_encoder(dense_x, merw_paths, batch, dense_mask)
+            dense_x = self.merw_path_encoder(dense_x, merw_paths, batch, dense_mask, merw_dists=merw_dists)
 
         dense_x = self.embed_drop(dense_x)
         nm = node_masks if node_masks is not None else dense_mask
