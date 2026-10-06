@@ -1313,7 +1313,7 @@ class HopMaskedTransformerModel(nn.Module):
             # For each sample, check whether the hop band contains any
             # off-diagonal edge.  A band that is all-identity (or all-zero)
             # means the graph diameter is smaller than every hop in this set.
-            has_off_diag = (stacked & ~eye.unsqueeze(0)).any(dim=(-2, -1))  # (B,)
+            has_off_diag = (stacked & ~eye.unsqueeze(0)).flatten(1).any(dim=1)  # (B,)
             # Start with the restricted mask for all samples …
             out[:, h] = stacked
             # … then promote samples whose hop band is trivially empty to global.
