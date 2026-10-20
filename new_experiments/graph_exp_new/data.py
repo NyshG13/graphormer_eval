@@ -464,16 +464,23 @@ def precompute_distance_matrices(dataset, cache_dir, split, max_hops=40,
         mm = np.memmap(dat_path, dtype=np.int16, mode="w+", shape=(total,))
         compute_fn = partial(_compute_dist_matrix_single, max_hops=max_hops)
 
-        with Pool(min(num_workers, max(n_graphs, 1))) as pool:
-            for lo in range(0, n_graphs, chunk_size):
-                hi = min(lo + chunk_size, n_graphs)
-                payload = [(int(sizes[i]), dataset[i].edge_index.numpy())
-                           for i in range(lo, hi)]
-                for j, dm in enumerate(pool.imap(compute_fn, payload,
-                                                 chunksize=16)):
-                    i = lo + j
-                    mm[offsets[i]:offsets[i] + sizes[i] ** 2] = dm.ravel()
-                print(f"    {hi}/{n_graphs}", flush=True)
+        n_workers = min(num_workers, max(n_graphs, 1))
+        if n_workers <= 1:
+            for i in range(n_graphs):
+                dm = compute_fn((int(sizes[i]), dataset[i].edge_index.numpy()))
+                mm[offsets[i]:offsets[i] + sizes[i] ** 2] = dm.ravel()
+            print(f"    {n_graphs}/{n_graphs}", flush=True)
+        else:
+            with Pool(n_workers) as pool:
+                for lo in range(0, n_graphs, chunk_size):
+                    hi = min(lo + chunk_size, n_graphs)
+                    payload = [(int(sizes[i]), dataset[i].edge_index.numpy())
+                               for i in range(lo, hi)]
+                    for j, dm in enumerate(pool.imap(compute_fn, payload,
+                                                     chunksize=16)):
+                        i = lo + j
+                        mm[offsets[i]:offsets[i] + sizes[i] ** 2] = dm.ravel()
+                    print(f"    {hi}/{n_graphs}", flush=True)
 
         mm.flush()
         del mm
