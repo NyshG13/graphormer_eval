@@ -74,6 +74,9 @@ GRAPH_DATASETS = {
         # Raw superpixel channels have very different scales (RGB stats vs.
         # coordinates vs. areas); standardize each channel with train-set stats.
         "normalize_node_feats": True,
+        # Edge attrs (rag-boundary): [mean Sobel along boundary, boundary pixel
+        # count]; channel 1 spans 1..573. Z-score both (Toenshoff et al. 2024).
+        "normalize_edge_feats": True,
     },
     # COCO-SP: same superpixel featurisation as PascalVOC-SP (14 node feats)
     # but 81 classes and ~113k train graphs. The graph count is what makes the
@@ -87,6 +90,7 @@ GRAPH_DATASETS = {
         "metric_name": "node_f1_macro",
         "source": "lrgb",
         "normalize_node_feats": True,
+        "normalize_edge_feats": True,
     },
     # ---- OGB graph-level (molecules; same 9-dim categorical atom features
     # ---- as Peptides, so `atom_categorical` applies unchanged) -------------
@@ -199,7 +203,18 @@ GRAPH_DATASETS = {
         "output_dim": "auto",
         "task_type": "regression",
         "level": "graph",
-        "node_encoder": "linear",
+        # Atom type (x) and bond type (edge_attr) are single-column
+        # categorical integers (28 atom types, 3 bond orders), not continuous
+        # vectors. "linear" fed the raw integer through nn.Linear(1, hidden),
+        # which imposes a false ordinal relationship between unrelated atom
+        # types. "categorical" routes both through embedding tables instead
+        # (see CategoricalNodeEncoder / CategoricalEdgeEncoder in models.py).
+        # Vocab sizes include a small safety margin over the documented
+        # ranges (atom type 0-27, bond order 1-3); out-of-range indices are
+        # clamped, so the margin only costs a few unused embedding rows.
+        "node_encoder": "categorical",
+        "node_categories": [32],
+        "edge_categories": [8],
         "node_feat_dim": "auto",
         "metric_name": "mae",
         "source": "zinc",
@@ -401,12 +416,16 @@ def precompute_distance_matrices(dataset, cache_dir, split, max_hops=40,
     if os.path.exists(dat_path) and os.path.exists(idx_path):
         with open(idx_path, "rb") as f:
             meta = pickle.load(f)
-        if meta.get("num_graphs") == len(dataset) and meta.get("max_hops") == max_hops:
-            print(f"  Loading cached distance matrices from {dat_path}", flush=True)
+        cached_max_hops = meta.get("max_hops", 0)
+        # Reuse cache if: same graph count AND (exact match OR cached has more hops)
+        if (meta.get("num_graphs") == len(dataset) and
+            cached_max_hops >= max_hops):
+            print(f"  Loading cached distance matrices from {dat_path} "
+                  f"(cached max_hops={cached_max_hops} >= requested {max_hops})", flush=True)
             return MemmapDistStore(dat_path, meta["offsets"], meta["sizes"])
         print(f"  Cache at {dat_path} is stale "
               f"(graphs {meta.get('num_graphs')}->{len(dataset)}, "
-              f"max_hops {meta.get('max_hops')}->{max_hops}); recomputing.",
+              f"max_hops {cached_max_hops}->{max_hops}); recomputing.",
               flush=True)
 
     n_graphs = len(dataset)
@@ -456,53 +475,198 @@ def precompute_distance_matrices(dataset, cache_dir, split, max_hops=40,
     return MemmapDistStore(dat_path, offsets, sizes)
 
 
+def _compute_pred_matrix_single(args):
+    """Predecessor matrix for one graph as int16 (-1 = none).
+
+    pred[s, t] is the node before t on a shortest s->t path. Any path is
+    rebuilt from it by walking back from t, so this replaces explicit path lists.
+    """
+    num_nodes, edge_index = args
+    adj = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+    adj[edge_index[0], edge_index[1]] = 1.0
+    _, pred = floyd_warshall(adj, directed=False, unweighted=True,
+                             return_predecessors=True)
+    return np.where(pred < 0, -1, pred).astype(np.int16)
+
+
+def precompute_predecessors(dataset, dist_store, cache_dir, split, num_workers=8,
+                            chunk_size=2048):
+    """Cache per-graph predecessor matrices (same memmap layout as dist store).
+
+    Reuses ``dist_store``'s offsets/sizes, and is chunked so RAM stays bounded.
+    """
+    dat_path = os.path.join(cache_dir, f"{split}_pred.dat")
+    offsets, sizes = dist_store.offsets, dist_store.sizes
+    total = int((sizes ** 2).sum())
+    if os.path.exists(dat_path) and os.path.getsize(dat_path) == total * 2:
+        print(f"  Loading cached predecessors from {dat_path}", flush=True)
+        return MemmapDistStore(dat_path, offsets, sizes)
+
+    n_graphs = len(dataset)
+    print(f"  Computing predecessors for {n_graphs} graphs "
+          f"({total * 2 / 1e9:.2f} GB on disk)...", flush=True)
+    _saved_transform = getattr(dataset, "transform", None)
+    if _saved_transform is not None:
+        dataset.transform = None
+    try:
+        mm = np.memmap(dat_path, dtype=np.int16, mode="w+", shape=(total,))
+        with Pool(min(num_workers, max(n_graphs, 1))) as pool:
+            for lo in range(0, n_graphs, chunk_size):
+                hi = min(lo + chunk_size, n_graphs)
+                payload = [(int(sizes[i]), dataset[i].edge_index.numpy())
+                           for i in range(lo, hi)]
+                for j, pm in enumerate(pool.imap(_compute_pred_matrix_single,
+                                                 payload, chunksize=16)):
+                    i = lo + j
+                    mm[offsets[i]:offsets[i] + sizes[i] ** 2] = pm.ravel()
+                print(f"    {hi}/{n_graphs}", flush=True)
+        mm.flush()
+        del mm
+    finally:
+        if _saved_transform is not None:
+            dataset.transform = _saved_transform
+    return MemmapDistStore(dat_path, offsets, sizes)
+
+
 class DistMaskDataset(torch.utils.data.Dataset):
-    """Wraps a PyG dataset with a precomputed distance-matrix store."""
-    def __init__(self, pyg_dataset, dist_store):
+    """Wraps a PyG dataset with precomputed distance matrices and optional path edges.
+
+    Supports both LazyPathStore (loads on demand) and list-based path stores.
+    """
+    def __init__(self, pyg_dataset, dist_store, path_store=None):
         assert len(pyg_dataset) == len(dist_store)
         self.pyg_dataset = pyg_dataset
         self.dist_store = dist_store
+        self.path_store = path_store  # Optional predecessor store
 
     def __len__(self):
         return len(self.pyg_dataset)
 
     def __getitem__(self, idx):
-        return self.pyg_dataset[idx], self.dist_store[idx]
+        item = (self.pyg_dataset[idx], self.dist_store[idx])
+        if self.path_store is not None:
+            # Lazy load this graph's path edges on access
+            path_edges = self.path_store[idx]
+            item = item + (path_edges,)
+        return item
 
 
-def collate_with_dist_masks(batch, max_hops=40):
+def _path_levels(dist_pad, pred_pad, L):
+    """Per-hop-level index lists for the PathEmbedder recursion.
+
+    All pairs (b, s, t) with 1 <= d(s, t) <= L, sorted by level (row-major
+    within a level, same order as torch.nonzero). For each pair:
+    p = pred[b, s, t]; parent = global position of (b, s, p), which lies in
+    level d - 1 (-1 for level 1). ptr[k-1]:ptr[k] is level k's slice.
+    """
+    B, N, _ = dist_pad.shape
+    flat = dist_pad.reshape(-1)
+    sel = np.flatnonzero((flat >= 1) & (flat <= L))
+    lev = flat[sel]
+    order = np.argsort(lev, kind="stable")
+    sel, lev = sel[order], lev[order]
+    b, rem = np.divmod(sel, N * N)
+    s, t = np.divmod(rem, N)
+    p = pred_pad.reshape(-1)[sel].astype(np.int64)
+    pos = np.full(flat.size, -1, dtype=np.int32)
+    pos[sel] = np.arange(sel.size, dtype=np.int32)
+    parent = pos[b * N * N + s * N + p]
+    ptr = np.searchsorted(lev, np.arange(1, L + 2), side="left")
+    return {
+        "b": torch.from_numpy(b.astype(np.int16)),
+        "s": torch.from_numpy(s.astype(np.int16)),
+        "t": torch.from_numpy(t.astype(np.int16)),
+        "p": torch.from_numpy(p.astype(np.int16)),
+        "parent": torch.from_numpy(parent),
+        "ptr": torch.from_numpy(ptr.astype(np.int64)),
+    }
+
+
+def collate_with_dist_masks(batch, max_hops=40, use_path_embeddings=False,
+                            dist_as_index=False):
     """
     Collate function for DistMaskDataset.
     Pads graphs and expands distance matrices into hop masks at the batch's
-    max_N.
+    max_N. Optionally handles precomputed or extracted shortest paths.
+
+    Args:
+        batch: list of (graph, distance_matrix) or (graph, distance_matrix, precomputed_paths) tuples
+        max_hops: maximum hop distance
+        use_path_embeddings: if True, use/extract path data
 
     Returns:
         pyg_batch: batched PyG Data object (standard)
         dist_masks_padded: (B, max_hops, max_N, max_N) float tensor
         node_masks: (B, max_N) boolean tensor
+        path_data: (optional) dict with per-graph path information
     """
-    graphs, dist_list = zip(*batch)
+    # Check if paths are precomputed (3-tuple) or need extraction (2-tuple)
+    has_precomputed_paths = len(batch[0]) == 3 if batch else False
+
+    if has_precomputed_paths:
+        graphs, dist_list, precomp_paths = zip(*batch)
+    else:
+        graphs, dist_list = zip(*batch)
+        precomp_paths = None
+
     pyg_batch = torch_geometric.data.Batch.from_data_list(list(graphs))
 
     B = len(graphs)
     max_N = max(g.num_nodes for g in graphs)
 
-    dm_padded = np.zeros((B, max_hops, max_N, max_N), dtype=np.float32)
+    # dist_as_index: return the int16 (B, N, N) distance matrix (-1 = padding /
+    # >= max_hops / unreachable) and build the one-hot hop masks on the GPU
+    # (~K*2x smaller transfer than the float32 (B, K, N, N) masks).
+    if dist_as_index:
+        dm_padded = np.full((B, max_N, max_N), -1, dtype=np.int16)
+    else:
+        dm_padded = np.zeros((B, max_hops, max_N, max_N), dtype=np.float32)
     node_masks = np.zeros((B, max_N), dtype=np.bool_)
+
+    # Per-graph offsets for mapping node indices in batch
+    node_offsets = [0]
+    for g in graphs:
+        node_offsets.append(node_offsets[-1] + g.num_nodes)
+
+    pred_padded = None
+    if use_path_embeddings:
+        assert has_precomputed_paths, "use_path_embeddings needs a predecessor store"
+        pred_padded = np.full((B, max_N, max_N), -1, dtype=np.int16)
 
     for i, (g, dist) in enumerate(zip(graphs, dist_list)):
         n = int(g.num_nodes)
-        # dist is int16 (n, n) with -1 for unreachable / beyond max_hops.
-        K_use = min(int(dist.max()) + 1, max_hops) if dist.size else 0
-        for k in range(K_use):
-            dm_padded[i, k, :n, :n] = (dist == k)
+        if dist_as_index:
+            dm_padded[i, :n, :n] = np.where(dist < max_hops, dist, -1)
+        else:
+            K_use = min(int(dist.max()) + 1, max_hops) if dist.size else 0
+            for k in range(K_use):
+                dm_padded[i, k, :n, :n] = (dist == k)
         node_masks[i, :n] = True
 
-    return (
+        if use_path_embeddings:
+            pred_padded[i, :n, :n] = precomp_paths[i]
+
+    result = (
         pyg_batch,
         torch.from_numpy(dm_padded),
         torch.from_numpy(node_masks),
     )
+
+    if use_path_embeddings:
+        path_data = {"pred": torch.from_numpy(pred_padded)}
+        if dist_as_index:
+            dist_pad = dm_padded
+        else:
+            dist_pad = np.full((B, max_N, max_N), -1, dtype=np.int16)
+            for i, (g, dist) in enumerate(zip(graphs, dist_list)):
+                n = int(g.num_nodes)
+                dist_pad[i, :n, :n] = np.where(dist < max_hops, dist, -1)
+        # Levels 1..max_hops-1 == PathEmbedder's L = min(K-1, max_hops).
+        path_data["levels"] = _path_levels(dist_pad, pred_padded, max_hops - 1)
+        pyg_batch.path_data = path_data
+        result = result + (path_data,)
+
+    return result
 
 
 # ================================================================
@@ -534,6 +698,46 @@ class ChannelwiseNormalize:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(dim={self.mean.numel()})"
+
+
+class EdgeChannelwiseNormalize:
+    """Per-channel standardization of ``edge_attr`` with train-set stats."""
+
+    def __init__(self, mean, std):
+        self.mean = torch.as_tensor(mean, dtype=torch.float32)
+        self.std = torch.as_tensor(std, dtype=torch.float32).clamp_min(1e-6)
+
+    def __call__(self, data):
+        e = getattr(data, "edge_attr", None)
+        if e is not None:
+            e = e.float()
+            e = e.unsqueeze(-1) if e.dim() == 1 else e
+            data.edge_attr = (e - self.mean) / self.std
+        return data
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(dim={self.mean.numel()})"
+
+
+def _fit_edge_channel_stats(dataset):
+    """Per-channel (mean, std) over all training edges of ``dataset``."""
+    store = getattr(dataset, "_data", None) or getattr(dataset, "data", None)
+    if store is not None and getattr(store, "edge_attr", None) is not None:
+        E = store.edge_attr.float()
+        E = E.unsqueeze(-1) if E.dim() == 1 else E
+        return E.mean(dim=0), E.std(dim=0, unbiased=False).clamp_min(1e-6)
+    n, s, ss = 0, None, None
+    for i in range(len(dataset)):
+        e = dataset[i].edge_attr.float()
+        e = e.unsqueeze(-1) if e.dim() == 1 else e
+        if s is None:
+            s, ss = torch.zeros(e.size(-1)), torch.zeros(e.size(-1))
+        n += e.size(0)
+        s += e.sum(dim=0)
+        ss += (e * e).sum(dim=0)
+    mean = s / max(n, 1)
+    std = (ss / max(n, 1) - mean ** 2).clamp_min(1e-12).sqrt().clamp_min(1e-6)
+    return mean, std
 
 
 def _fit_channel_stats(dataset, dim):
@@ -650,7 +854,8 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
                 dist_mask_workers=8, use_lap_pe=False, lap_pe_dim=8,
                 dataset_name="Peptides-func", return_info=False,
                 subgraph_mode="partition", num_parts=128, egonet_hops=2,
-                egonet_max_nodes=1024, max_egonet_samples=None, seed=0):
+                egonet_max_nodes=1024, max_egonet_samples=None, seed=0,
+                use_path_embeddings=False, dist_as_index=False):
     """Load train/val/test splits and return loaders + datasets.
 
     Args:
@@ -664,6 +869,8 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
                   graphs are large; consider lowering this (e.g. 12-16) when
                   loading that dataset.
         dist_mask_workers: number of multiprocessing workers for Floyd-Warshall.
+        use_path_embeddings: if True and use_dist_masks is True, extract shortest paths
+                            and return (pyg_batch, dist_masks, node_masks, path_data).
         subgraph_mode: "partition" | "egonet" — only used by transductive
                        single-graph datasets (ogbn-arxiv, ogbn-products,
                        arxiv-year). See ``transductive.py``.
@@ -747,6 +954,16 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
         print(f"[{dataset_name}] channel-wise feature normalization applied "
               f"(train-set mean/std, dim={dim}).", flush=True)
 
+    # Channel-wise edge-feature standardization (train-set stats).
+    if info.get("normalize_edge_feats"):
+        e_mean, e_std = _fit_edge_channel_stats(train_ds)
+        edge_t = EdgeChannelwiseNormalize(e_mean, e_std)
+        for ds in (train_ds, val_ds, test_ds):
+            base_t = getattr(ds, "transform", None)
+            ds.transform = Compose([edge_t, base_t]) if base_t is not None else edge_t
+        print(f"[{dataset_name}] edge feature normalization applied "
+              f"(mean={e_mean.tolist()}, std={e_std.tolist()}).", flush=True)
+
     if use_dist_masks:
         # Transductive caches depend on the sampling config, so key on it —
         # otherwise switching --num_parts would silently reuse the wrong cache.
@@ -763,11 +980,23 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
         test_dm = precompute_distance_matrices(
             test_ds, cache_dir, "test", max_hops, dist_mask_workers)
 
-        train_wrapped = DistMaskDataset(train_ds, train_dm)
-        val_wrapped = DistMaskDataset(val_ds, val_dm)
-        test_wrapped = DistMaskDataset(test_ds, test_dm)
+        # Precompute paths if needed
+        train_paths = None
+        val_paths = None
+        test_paths = None
+        if use_path_embeddings:
+            print("Precomputing shortest paths...", flush=True)
+            train_paths = precompute_predecessors(train_ds, train_dm, cache_dir, "train", dist_mask_workers)
+            val_paths = precompute_predecessors(val_ds, val_dm, cache_dir, "val", dist_mask_workers)
+            test_paths = precompute_predecessors(test_ds, test_dm, cache_dir, "test", dist_mask_workers)
 
-        collate_fn = partial(collate_with_dist_masks, max_hops=max_hops)
+        train_wrapped = DistMaskDataset(train_ds, train_dm, train_paths)
+        val_wrapped = DistMaskDataset(val_ds, val_dm, val_paths)
+        test_wrapped = DistMaskDataset(test_ds, test_dm, test_paths)
+
+        collate_fn = partial(collate_with_dist_masks, max_hops=max_hops,
+                            use_path_embeddings=use_path_embeddings,
+                            dist_as_index=dist_as_index)
 
         # Use standard PyTorch DataLoader (not PyG's) because our custom
         # collate_fn handles batching and PyG's Collater cannot handle the
