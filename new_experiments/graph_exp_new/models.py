@@ -73,10 +73,36 @@ class LinearBondEncoder(nn.Module):
         return self.proj(x)
 
 
+class CategoricalBondEncoder(nn.Module):
+    """Categorical bond/edge encoder for datasets with discrete edge types (e.g. ZINC)."""
+    def __init__(self, categories, hidden_dim: int):
+        super().__init__()
+        if isinstance(categories, int):
+            categories = [categories]
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=c, embedding_dim=hidden_dim)
+            for c in categories
+        ])
+        for emb in self.embeddings:
+            nn.init.normal_(emb.weight, std=0.01)
+
+    def forward(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
+        h = 0
+        n_cols = min(edge_attr.size(-1), len(self.embeddings))
+        for i in range(n_cols):
+            feat_i = edge_attr[:, i].long().clamp(min=0, max=self.embeddings[i].num_embeddings - 1)
+            h = h + self.embeddings[i](feat_i)
+        return h
+
+
 def build_bond_encoder(hidden_dim, dataset_name="Peptides-func", edge_feat_dim=None):
-    """Factory: categorical BondEncoder for molecular (atom_categorical)
+    """Factory: categorical BondEncoder for molecular (atom_categorical / categorical)
     datasets, LinearBondEncoder otherwise."""
     info = get_dataset_info(dataset_name)
+    if info.get("edge_categories") or info.get("node_encoder") == "categorical":
+        return CategoricalBondEncoder(info.get("edge_categories", [8]), hidden_dim)
     if info["node_encoder"] == "atom_categorical":
         return BondEncoder(hidden_dim)
     in_dim = edge_feat_dim if edge_feat_dim not in (None, "auto") else hidden_dim
@@ -232,6 +258,51 @@ class LinearNodeEncoder(nn.Module):
         return h
 
 
+class CategoricalNodeEncoder(nn.Module):
+    """Categorical node encoder for discrete integer features (e.g. ZINC12k)."""
+    def __init__(self, categories, hidden_dim, lap_pe_dim=0, use_edge_features=False,
+                 edge_categories=None, dataset_name="ZINC12k"):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.lap_pe_dim = lap_pe_dim
+        if isinstance(categories, int):
+            categories = [categories]
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=c, embedding_dim=hidden_dim)
+            for c in categories
+        ])
+        for emb in self.embeddings:
+            nn.init.normal_(emb.weight, std=0.01)
+        self.post = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        if lap_pe_dim > 0:
+            self.lap_pe_encoder = nn.Linear(lap_pe_dim, hidden_dim)
+        self.use_edge_features = use_edge_features
+        if use_edge_features:
+            self.bond_encoder = build_bond_encoder(
+                hidden_dim, dataset_name=dataset_name,
+                edge_feat_dim=edge_categories[0] if edge_categories else None,
+            )
+
+    def forward(self, x, edge_index, edge_attr, lap_pe=None):
+        if x.dim() == 1:
+            x = x.unsqueeze(-1)
+        h = 0
+        n_cols = min(x.size(-1), len(self.embeddings))
+        for i in range(n_cols):
+            feat_i = x[:, i].long().clamp(min=0, max=self.embeddings[i].num_embeddings - 1)
+            h = h + self.embeddings[i](feat_i)
+        h = self.post(h)
+        if self.use_edge_features and edge_attr is not None and edge_index is not None:
+            edge_emb = self.bond_encoder(edge_attr)
+            h = aggregate_edges_to_nodes(h, edge_index, edge_emb)
+        if self.lap_pe_dim > 0 and lap_pe is not None:
+            h = h + self.lap_pe_encoder(lap_pe)
+        return h
+
+
 def build_node_encoder(hidden_dim, lap_pe_dim=0, dataset_name="Peptides-func",
                        node_feat_dim=None, use_edge_features=False,
                        edge_feat_dim=None):
@@ -248,6 +319,15 @@ def build_node_encoder(hidden_dim, lap_pe_dim=0, dataset_name="Peptides-func",
     if kind == "atom_categorical":
         return NodeEncoder(hidden_dim, lap_pe_dim=lap_pe_dim,
                            use_edge_features=use_edge_features)
+    if kind == "categorical":
+        return CategoricalNodeEncoder(
+            categories=info.get("node_categories", [32]),
+            hidden_dim=hidden_dim,
+            lap_pe_dim=lap_pe_dim,
+            use_edge_features=use_edge_features,
+            edge_categories=info.get("edge_categories", [8]),
+            dataset_name=info["name"],
+        )
     if kind == "linear":
         # Precedence: explicit arg > registry info > hidden_dim fallback.
         if node_feat_dim not in (None, "auto"):
