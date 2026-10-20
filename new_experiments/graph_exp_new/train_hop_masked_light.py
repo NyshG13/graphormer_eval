@@ -155,6 +155,18 @@ def build_parser():
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--amp", action="store_true", default=False,
                    help="bf16 autocast for the forward pass (CUDA only).")
+
+    # Transductive (single-graph) dataset settings
+    p.add_argument("--subgraph_mode", type=str, default="partition",
+                   choices=["partition", "egonet"],
+                   help="How to cut the single graph for transductive datasets "
+                        "(Cora / ogbn-arxiv / ogbn-products).")
+    p.add_argument("--num_parts", type=int, default=3,
+                   help="Number of partitions for subgraph_mode=partition. "
+                        "Cora (2708 nodes) with 3 parts gives ~900 nodes/part, "
+                        "affordable for max_hops=20 dense masks.")
+    p.add_argument("--egonet_hops", type=int, default=2)
+    p.add_argument("--egonet_max_nodes", type=int, default=1024)
     return p
 
 
@@ -301,6 +313,10 @@ def main():
         seed=args.seed,
         use_path_embeddings=args.use_path_embeddings,
         dist_as_index=True,
+        subgraph_mode=args.subgraph_mode,
+        num_parts=args.num_parts,
+        egonet_hops=args.egonet_hops,
+        egonet_max_nodes=args.egonet_max_nodes,
     )
     dataset_name = dataset_info["name"]
 

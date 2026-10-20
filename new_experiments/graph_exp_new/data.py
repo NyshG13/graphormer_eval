@@ -114,6 +114,18 @@ GRAPH_DATASETS = {
         "nan_labels": True,             # unmeasured (task, molecule) pairs
     },
     # ---- Transductive node classification (cut into subgraphs) -------------
+    # Cora: 2708 nodes, 1433-dim BoW features, 7 classes, avg SPL ~6.3,
+    # diameter ~19.  Use max_hops=20 and num_parts=3 (~900 nodes/part).
+    "Cora": {
+        "output_dim": 7,
+        "task_type": "multiclass",
+        "level": "node",
+        "node_encoder": "linear",
+        "node_feat_dim": 1433,
+        "metric_name": "accuracy",
+        "source": "planetoid",
+        "transductive": True,
+    },
     "ogbn-arxiv": {
         "output_dim": 40,
         "task_type": "multiclass",
@@ -240,6 +252,7 @@ DATASET_ALIASES = {
     "arxiv_year": "arxiv-year",
     "arxivyear": "arxiv-year",
     "pcqm-contact": "PCQM-Contact",
+    "cora": "Cora",
 }
 
 DATASET_CHOICES = sorted(set(GRAPH_DATASETS.keys()) | set(DATASET_ALIASES.keys()))
@@ -911,6 +924,22 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
     if source == "ogb_graph":
         train_ds, val_ds, test_ds = _build_ogb_graph_splits(
             pyg_name, transform=transform)
+    elif source == "planetoid":
+        from transductive import build_transductive_splits, ListGraphDataset
+
+        tr, va, te = build_transductive_splits(
+            dataset_name, root="./data", subgraph_mode=subgraph_mode,
+            num_parts=num_parts, egonet_hops=egonet_hops,
+            egonet_max_nodes=egonet_max_nodes,
+            max_egonet_samples=max_egonet_samples, seed=seed)
+        if transform is not None:
+            tr = [transform(g) for g in tr]
+            va = [transform(g) for g in va]
+            te = [transform(g) for g in te]
+        _wrap = partial(ListGraphDataset,
+                        num_classes=info["output_dim"],
+                        num_node_features=info["node_feat_dim"])
+        train_ds, val_ds, test_ds = _wrap(tr), _wrap(va), _wrap(te)
     elif source == "transductive":
         from transductive import build_transductive_splits, ListGraphDataset
 

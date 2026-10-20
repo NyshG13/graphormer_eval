@@ -69,6 +69,40 @@ def _load_ogbn(name: str, root: str) -> Tuple[Data, Dict[str, torch.Tensor]]:
     return data, {k: v.view(-1) for k, v in split.items()}
 
 
+def _load_planetoid(name: str, root: str) -> Tuple[Data, Dict[str, torch.Tensor]]:
+    """Load a Planetoid graph (Cora / CiteSeer / PubMed) with its standard splits.
+
+    PyG stores splits as boolean masks on the single Data object.  We convert
+    them to sorted index tensors so the rest of the transductive pipeline sees
+    the same interface as the ogbn loader.
+    """
+    try:
+        from torch_geometric.datasets import Planetoid
+    except ImportError as e:
+        raise ImportError(
+            "Planetoid datasets require torch_geometric: pip install torch_geometric"
+        ) from e
+
+    # Canonicalise: "Cora" -> "Cora", "citeseer" -> "CiteSeer", etc.
+    _name_map = {"cora": "Cora", "citeseer": "CiteSeer", "pubmed": "PubMed"}
+    pyg_name = _name_map.get(name.lower(), name)
+    ds = Planetoid(root=root, name=pyg_name)
+    data = ds[0]
+    data.y = data.y.view(-1).long()
+    if data.x is not None:
+        data.x = data.x.float()
+
+    def _mask_to_idx(mask: torch.Tensor) -> torch.Tensor:
+        return mask.nonzero(as_tuple=False).view(-1).sort()[0]
+
+    split = {
+        "train": _mask_to_idx(data.train_mask),
+        "valid": _mask_to_idx(data.val_mask),
+        "test":  _mask_to_idx(data.test_mask),
+    }
+    return data, split
+
+
 def _load_arxiv_year(root: str, seed: int = 0,
                      num_classes: int = 5) -> Tuple[Data, Dict[str, torch.Tensor]]:
     """arxiv-year (Lim et al., 2021) built from ogbn-arxiv.
@@ -112,7 +146,10 @@ def load_transductive_graph(dataset_name: str, root: str,
     called with ``directed=False`` downstream), so we symmetrise here to keep
     the sparse ``edge_index`` consistent with the dense hop masks.
     """
-    if dataset_name == "arxiv-year":
+    _planetoid_names = {"Cora", "CiteSeer", "PubMed"}
+    if dataset_name in _planetoid_names:
+        data, split = _load_planetoid(dataset_name, root)
+    elif dataset_name == "arxiv-year":
         data, split = _load_arxiv_year(root, seed=seed)
     elif dataset_name in ("ogbn-arxiv", "ogbn-products"):
         data, split = _load_ogbn(dataset_name, root)
