@@ -892,6 +892,201 @@ class PostGATv2Block(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MERW Path Encoder
+# ---------------------------------------------------------------------------
+class MERWPathEncoder(nn.Module):
+    """Encodes sampled MERW paths to enrich base node representations.
+
+    Supports three feature modalities along the sampled walks:
+      - 'node': gathers node features along the random walk.
+      - 'edge': gathers edge/bond embeddings along each transition in the random walk.
+      - 'both': combines both edge and node features along the walk.
+
+    Along each walk:
+      Step positional embeddings and distance embeddings are added.
+      Tokens are merged via 'concat', 'conv', or 'cross_attn' into 1 vector per path.
+      Target node attends over its M candidate paths to aggregate path context.
+      Learned gate smoothly injects path features: dense_x + gate * LayerNorm(x_path).
+    """
+    def __init__(
+        self,
+        hidden_dim: int,
+        path_len: int = 3,
+        num_paths: int = 20,
+        max_hops: int = 40,
+        merge_mode: str = "concat",
+        feature_type: str = "node",
+        dropout: float = 0.0,
+        dataset_name: str = "Cora",
+        edge_feat_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.path_len = path_len
+        self.num_paths = num_paths
+        self.max_hops = max_hops
+        self.merge_mode = merge_mode
+        self.feature_type = feature_type
+        self.scale = hidden_dim ** -0.5
+
+        if feature_type == "node":
+            self.seq_len = path_len + 1
+        else:
+            self.seq_len = path_len
+
+        if feature_type in ("edge", "both"):
+            self.bond_encoder = build_bond_encoder(
+                hidden_dim, dataset_name=dataset_name, edge_feat_dim=edge_feat_dim
+            )
+        else:
+            self.bond_encoder = None
+
+        self.step_embed = nn.Embedding(self.seq_len + 1, hidden_dim)
+        self.dist_embed = nn.Embedding(max_hops + 1, hidden_dim)
+
+        if merge_mode == "concat":
+            self.path_mlp = nn.Sequential(
+                nn.Linear(self.seq_len * hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        elif merge_mode == "conv":
+            self.conv = nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=2),
+            )
+        elif merge_mode == "cross_attn":
+            self.local_q_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.local_k_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.local_v_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.local_drop = nn.Dropout(dropout)
+        else:
+            raise ValueError(f"Unknown path merge mode: {merge_mode}")
+
+        self.path_norm = nn.LayerNorm(hidden_dim)
+
+        self.node_q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.path_k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.path_v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.attn_drop = nn.Dropout(dropout)
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.path_gate = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        dense_x: torch.Tensor,
+        merw_paths: torch.Tensor,
+        batch: torch_geometric.data.Batch,
+        node_mask: Optional[torch.Tensor] = None,
+        merw_dists: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, N, d = dense_x.shape
+        M = self.num_paths
+        seq_len = self.seq_len
+
+        clamped_paths = merw_paths.clamp(min=0, max=N - 1)
+
+        if self.feature_type == "node":
+            flat_idx = clamped_paths.view(B, N * M * seq_len, 1).expand(-1, -1, d)
+            gathered = torch.gather(dense_x, 1, flat_idx)
+            tokens = gathered.view(B, N, M, seq_len, d)
+
+            step_idx = torch.arange(seq_len, device=dense_x.device).view(1, 1, 1, seq_len)
+            tokens = tokens + self.step_embed(step_idx)
+
+            if merw_dists is not None:
+                dist_clamped = merw_dists.clamp(min=0, max=self.dist_embed.num_embeddings - 1)
+                tokens = tokens + self.dist_embed(dist_clamped)
+
+        elif self.feature_type in ("edge", "both"):
+            L = min(self.path_len, clamped_paths.shape[-1] - 1)
+            src_nodes = clamped_paths[:, :, :, :L]
+            dst_nodes = clamped_paths[:, :, :, 1:L+1]
+
+            if not hasattr(batch, "edge_attr") or batch.edge_attr is None:
+                num_edges = batch.edge_index.size(1) if hasattr(batch, "edge_index") and batch.edge_index is not None else 0
+                if num_edges > 0:
+                    edge_attr = torch.ones((num_edges, 1), device=dense_x.device, dtype=dense_x.dtype)
+                else:
+                    return dense_x
+            else:
+                edge_attr = batch.edge_attr
+
+            edge_emb = self.bond_encoder(edge_attr)
+
+            E_dense = torch.zeros(B, N, N, d, device=dense_x.device, dtype=dense_x.dtype)
+            src_global, dst_global = batch.edge_index[0], batch.edge_index[1]
+            edge_batch = batch.batch[src_global]
+
+            ptr = getattr(batch, "ptr", None)
+            if ptr is not None:
+                src_local = src_global - ptr[edge_batch]
+                dst_local = dst_global - ptr[edge_batch]
+            else:
+                node_offsets = torch.zeros(B, dtype=torch.long, device=dense_x.device)
+                for b in range(B):
+                    node_offsets[b] = (batch.batch < b).sum()
+                src_local = src_global - node_offsets[edge_batch]
+                dst_local = dst_global - node_offsets[edge_batch]
+
+            valid_edges = (src_local < N) & (dst_local < N) & (src_local >= 0) & (dst_local >= 0)
+            E_dense[edge_batch[valid_edges], src_local[valid_edges], dst_local[valid_edges]] = edge_emb[valid_edges]
+
+            b_idx = torch.arange(B, device=dense_x.device).view(B, 1, 1, 1).expand(B, N, M, L)
+            edge_tokens = E_dense[b_idx, src_nodes, dst_nodes]
+            del E_dense, b_idx
+
+            if self.feature_type == "both":
+                flat_idx = dst_nodes.reshape(B, N * M * L, 1).expand(-1, -1, d)
+                node_tokens = torch.gather(dense_x, 1, flat_idx).view(B, N, M, L, d)
+                tokens = edge_tokens + node_tokens
+            else:
+                tokens = edge_tokens
+
+            step_idx = torch.arange(L, device=dense_x.device).view(1, 1, 1, L)
+            tokens = tokens + self.step_embed(step_idx)
+
+            if merw_dists is not None:
+                clamped_dists = merw_dists[:, :, :, 1:L+1].clamp(min=0, max=self.dist_embed.num_embeddings - 1)
+                tokens = tokens + self.dist_embed(clamped_dists)
+
+        if self.merge_mode == "concat":
+            flat_tokens = tokens.view(B, N, M, seq_len * d)
+            h_paths = self.path_mlp(flat_tokens)
+        elif self.merge_mode == "conv":
+            conv_in = tokens.view(B * N * M, seq_len, d).transpose(1, 2)
+            conv_out = self.conv(conv_in)[:, :, :seq_len]
+            h_paths = conv_out[:, :, -1].view(B, N, M, d)
+        elif self.merge_mode == "cross_attn":
+            q_tok = self.local_q_proj(tokens[:, :, :, 0:1, :])
+            k_tok = self.local_k_proj(tokens)
+            v_tok = self.local_v_proj(tokens)
+            local_scores = torch.matmul(q_tok, k_tok.transpose(-2, -1)) * self.scale
+            local_attn = F.softmax(local_scores, dim=-1)
+            local_attn = self.local_drop(local_attn)
+            h_paths = torch.matmul(local_attn, v_tok).squeeze(-2)
+
+        h_paths = self.path_norm(h_paths)
+
+        q_node = self.node_q_proj(dense_x).unsqueeze(2)
+        k_path = self.path_k_proj(h_paths)
+        v_path = self.path_v_proj(h_paths)
+
+        scores = torch.matmul(q_node, k_path.transpose(-2, -1)) * self.scale
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.attn_drop(attn_weights)
+        x_path = torch.matmul(attn_weights, v_path).squeeze(2)
+
+        out = dense_x + self.path_gate * self.final_norm(x_path)
+        if node_mask is not None:
+            out = out * node_mask.unsqueeze(-1).to(out.dtype)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Top-level model.
 # ---------------------------------------------------------------------------
 class HopMaskedTransformerModel(nn.Module):
@@ -930,6 +1125,11 @@ class HopMaskedTransformerModel(nn.Module):
         multihop_include_global: bool = True,
         embed_dropout: float = 0.0,
         use_path_embeddings: bool = False,
+        use_merw: bool = False,
+        merw_num_paths: int = 20,
+        merw_path_len: int = 3,
+        merw_merge: str = "concat",
+        merw_feature_type: str = "node",
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -1027,6 +1227,22 @@ class HopMaskedTransformerModel(nn.Module):
             self.path_embedder = PathEmbedder(
                 hidden_dim=hidden_dim,
                 max_hops=max_hops,
+                dataset_name=dataset_name,
+                edge_feat_dim=edge_feat_dim,
+            )
+
+        # MERW path enrichment
+        self.use_merw = use_merw
+        self.merw_path_encoder = None
+        if use_merw:
+            self.merw_path_encoder = MERWPathEncoder(
+                hidden_dim=hidden_dim,
+                path_len=merw_path_len,
+                num_paths=merw_num_paths,
+                max_hops=max_hops,
+                merge_mode=merw_merge,
+                feature_type=merw_feature_type,
+                dropout=dropout,
                 dataset_name=dataset_name,
                 edge_feat_dim=edge_feat_dim,
             )
@@ -1283,9 +1499,13 @@ class HopMaskedTransformerModel(nn.Module):
         h = self.encoder(batch.x, batch.edge_index, batch.edge_attr, lap_pe=None)
         return to_dense_batch(h, batch.batch)
 
-    def forward(self, batch, dist_masks, node_masks):
+    def forward(self, batch, dist_masks, node_masks=None, merw_paths=None, merw_dists=None):
         """Forward pass. Returns (logits, node_emb, aux_loss, None)."""
         dense_x, dense_mask = self.encode_dense(batch)
+        if self.use_merw and self.merw_path_encoder is not None and merw_paths is not None:
+            dense_x = self.merw_path_encoder(
+                dense_x, merw_paths, batch, node_mask=dense_mask, merw_dists=merw_dists
+            )
         dense_x = self.embed_drop(dense_x)
         nm = node_masks if node_masks is not None else dense_mask
 

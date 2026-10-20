@@ -122,6 +122,7 @@ GRAPH_DATASETS = {
         "level": "node",
         "node_encoder": "linear",
         "node_feat_dim": 1433,
+        "edge_feat_dim": 1,
         "metric_name": "accuracy",
         "source": "planetoid",
         "transductive": True,
@@ -197,6 +198,7 @@ GRAPH_DATASETS = {
         "level": "node",
         "node_encoder": "linear",
         "node_feat_dim": 3,
+        "edge_feat_dim": 1,
         "metric_name": "accuracy",
         "source": "gnn_benchmark",
         "pyg_name": "PATTERN",
@@ -555,16 +557,194 @@ def precompute_predecessors(dataset, dist_store, cache_dir, split, num_workers=8
     return MemmapDistStore(dat_path, offsets, sizes)
 
 
-class DistMaskDataset(torch.utils.data.Dataset):
-    """Wraps a PyG dataset with precomputed distance matrices and optional path edges.
+def _compute_merw_single(args, num_paths=20, path_len=3, max_hops=40):
+    """Compute MERW paths and distance tags for a single graph.
 
-    Supports both LazyPathStore (loads on demand) and list-based path stores.
+    Returns:
+        paths: (N, num_paths, path_len + 1) int16 array
+        dists: (N, num_paths, path_len + 1) int16 array
     """
-    def __init__(self, pyg_dataset, dist_store, path_store=None):
+    num_nodes, edge_index = args
+    seq_len = path_len + 1
+    if num_nodes == 0:
+        return (np.zeros((0, num_paths, seq_len), dtype=np.int16),
+                np.zeros((0, num_paths, seq_len), dtype=np.int16))
+
+    adj = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+    adj[edge_index[0], edge_index[1]] = 1.0
+
+    dist = floyd_warshall(adj, directed=False, unweighted=True)
+    dist = np.where(np.isfinite(dist) & (dist < max_hops), dist, -1).astype(np.int16)
+
+    # Compute MERW transition matrix P
+    if num_nodes <= 1 or edge_index.shape[1] == 0:
+        P = np.eye(num_nodes, dtype=np.float32)
+    else:
+        try:
+            w, v = eigsh(adj.astype(np.float64), k=1, which='LA')
+            evalue = float(w[0])
+            evector = np.abs(v[:, 0])
+        except Exception:
+            degrees = adj.sum(axis=1)
+            evalue = float(max(degrees.max(), 1.0))
+            evector = np.maximum(degrees, 1.0).astype(np.float64)
+
+        evalue = max(evalue, 1e-8)
+        evector = np.maximum(evector, 1e-12)
+        inv_denom = 1.0 / (evalue * evector)
+        # P[i, j] = A[i, j] * u[j] / (lambda * u[i])
+        P = adj * evector[None, :] * inv_denom[:, None]
+        row_sums = P.sum(axis=1, keepdims=True)
+        zero_rows = (row_sums.ravel() == 0)
+        row_sums[row_sums == 0] = 1.0
+        P = (P / row_sums).astype(np.float32)
+        if np.any(zero_rows):
+            P[zero_rows, :] = 0.0
+            for z_idx in np.flatnonzero(zero_rows):
+                P[z_idx, z_idx] = 1.0
+
+    paths = np.zeros((num_nodes, num_paths, seq_len), dtype=np.int16)
+    dists = np.zeros((num_nodes, num_paths, seq_len), dtype=np.int16)
+
+    P_cdf = np.cumsum(P, axis=1)
+    P_cdf[:, -1] = 1.0
+
+    for i in range(num_nodes):
+        paths[i, :, 0] = i
+        dists[i, :, 0] = 0
+
+    node_indices = np.arange(num_nodes)
+    for m in range(num_paths):
+        curr_nodes = np.arange(num_nodes)
+        for step in range(1, seq_len):
+            r = np.random.rand(num_nodes, 1)
+            next_nodes = (r < P_cdf[curr_nodes]).argmax(axis=1)
+            paths[:, m, step] = next_nodes
+            if dist.size > 0:
+                dists[:, m, step] = np.maximum(dist[node_indices, next_nodes], 0)
+            curr_nodes = next_nodes
+
+    return paths, dists
+
+
+class MemmapMERWStore:
+    """Disk-backed store of variable-size int16 MERW path and distance arrays."""
+    def __init__(self, dat_path, offsets, sizes, num_paths, seq_len):
+        self.dat_path = dat_path
+        self.offsets = offsets
+        self.sizes = sizes
+        self.num_paths = num_paths
+        self.seq_len = seq_len
+        self._mm = None
+
+    def _ensure_open(self):
+        if self._mm is None:
+            self._mm = np.memmap(self.dat_path, dtype=np.int16, mode="r")
+
+    def __len__(self):
+        return len(self.sizes)
+
+    def __getitem__(self, idx):
+        self._ensure_open()
+        n = int(self.sizes[idx])
+        start = int(self.offsets[idx])
+        item_size = n * self.num_paths * self.seq_len
+        paths = self._mm[start:start + item_size].reshape(n, self.num_paths, self.seq_len)
+        dists = self._mm[start + item_size:start + 2 * item_size].reshape(n, self.num_paths, self.seq_len)
+        return paths, dists
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_mm"] = None
+        return state
+
+
+def precompute_merw_paths(dataset, cache_dir, split, num_paths=20, path_len=3, max_hops=40,
+                          num_workers=8, chunk_size=2048):
+    os.makedirs(cache_dir, exist_ok=True)
+    seq_len = path_len + 1
+    dat_path = os.path.join(cache_dir, f"{split}_merw_p{num_paths}_l{path_len}.dat")
+    idx_path = os.path.join(cache_dir, f"{split}_merw_p{num_paths}_l{path_len}_index.pkl")
+
+    if os.path.exists(dat_path) and os.path.exists(idx_path):
+        try:
+            with open(idx_path, "rb") as f:
+                meta = pickle.load(f)
+            if (meta.get("num_graphs") == len(dataset) and 
+                meta.get("num_paths") == num_paths and 
+                meta.get("path_len") == path_len):
+                print(f"  Loading cached MERW paths from {dat_path}", flush=True)
+                return MemmapMERWStore(dat_path, meta["offsets"], meta["sizes"], num_paths, seq_len)
+        except Exception as e:
+            print(f"  Failed loading cached MERW index ({e}), recomputing...", flush=True)
+
+    n_graphs = len(dataset)
+    _saved_transform = getattr(dataset, "transform", None)
+    if _saved_transform is not None:
+        dataset.transform = None
+    try:
+        sizes = np.array([int(dataset[i].num_nodes) for i in range(n_graphs)], dtype=np.int64)
+        per_graph_elements = sizes * num_paths * seq_len * 2  # paths + dists
+        offsets = np.zeros(n_graphs, dtype=np.int64)
+        np.cumsum(per_graph_elements[:-1], out=offsets[1:])
+        total = int(per_graph_elements.sum())
+
+        print(f"  Computing MERW paths for {n_graphs} graphs "
+              f"(num_paths={num_paths}, path_len={path_len}, {total * 2 / 1e9:.2f} GB on disk)...",
+              flush=True)
+
+        mm = np.memmap(dat_path, dtype=np.int16, mode="w+", shape=(total,))
+        compute_fn = partial(_compute_merw_single, num_paths=num_paths, path_len=path_len, max_hops=max_hops)
+
+        actual_workers = min(num_workers, max(n_graphs, 1))
+        if actual_workers <= 1:
+            for lo in range(0, n_graphs, chunk_size):
+                hi = min(lo + chunk_size, n_graphs)
+                for i in range(lo, hi):
+                    payload = (int(sizes[i]), dataset[i].edge_index.numpy())
+                    p_arr, d_arr = compute_fn(payload)
+                    n = int(sizes[i])
+                    item_sz = n * num_paths * seq_len
+                    start = offsets[i]
+                    mm[start:start + item_sz] = p_arr.ravel()
+                    mm[start + item_sz:start + 2 * item_sz] = d_arr.ravel()
+                print(f"    {hi}/{n_graphs}", flush=True)
+        else:
+            with Pool(actual_workers) as pool:
+                for lo in range(0, n_graphs, chunk_size):
+                    hi = min(lo + chunk_size, n_graphs)
+                    payload = [(int(sizes[i]), dataset[i].edge_index.numpy())
+                               for i in range(lo, hi)]
+                    for j, (p_arr, d_arr) in enumerate(pool.imap(compute_fn, payload, chunksize=16)):
+                        i = lo + j
+                        n = int(sizes[i])
+                        item_sz = n * num_paths * seq_len
+                        start = offsets[i]
+                        mm[start:start + item_sz] = p_arr.ravel()
+                        mm[start + item_sz:start + 2 * item_sz] = d_arr.ravel()
+                    print(f"    {hi}/{n_graphs}", flush=True)
+
+        mm.flush()
+        del mm
+    finally:
+        if _saved_transform is not None:
+            dataset.transform = _saved_transform
+
+    with open(idx_path, "wb") as f:
+        pickle.dump({"offsets": offsets, "sizes": sizes,
+                     "num_graphs": n_graphs, "num_paths": num_paths, "path_len": path_len}, f)
+    print(f"  Saved MERW paths to {dat_path}", flush=True)
+    return MemmapMERWStore(dat_path, offsets, sizes, num_paths, seq_len)
+
+
+class DistMaskDataset(torch.utils.data.Dataset):
+    """Wraps a PyG dataset with precomputed distance matrices and optional path / MERW stores."""
+    def __init__(self, pyg_dataset, dist_store, path_store=None, merw_store=None):
         assert len(pyg_dataset) == len(dist_store)
         self.pyg_dataset = pyg_dataset
         self.dist_store = dist_store
         self.path_store = path_store  # Optional predecessor store
+        self.merw_store = merw_store  # Optional MERW store
 
     def __len__(self):
         return len(self.pyg_dataset)
@@ -572,9 +752,9 @@ class DistMaskDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = (self.pyg_dataset[idx], self.dist_store[idx])
         if self.path_store is not None:
-            # Lazy load this graph's path edges on access
-            path_edges = self.path_store[idx]
-            item = item + (path_edges,)
+            item = item + (self.path_store[idx],)
+        if self.merw_store is not None:
+            item = item + (self.merw_store[idx],)
         return item
 
 
@@ -610,31 +790,30 @@ def _path_levels(dist_pad, pred_pad, L):
 
 
 def collate_with_dist_masks(batch, max_hops=40, use_path_embeddings=False,
-                            dist_as_index=False):
+                            dist_as_index=False, use_merw=False):
     """
     Collate function for DistMaskDataset.
     Pads graphs and expands distance matrices into hop masks at the batch's
-    max_N. Optionally handles precomputed or extracted shortest paths.
-
-    Args:
-        batch: list of (graph, distance_matrix) or (graph, distance_matrix, precomputed_paths) tuples
-        max_hops: maximum hop distance
-        use_path_embeddings: if True, use/extract path data
-
-    Returns:
-        pyg_batch: batched PyG Data object (standard)
-        dist_masks_padded: (B, max_hops, max_N, max_N) float tensor
-        node_masks: (B, max_N) boolean tensor
-        path_data: (optional) dict with per-graph path information
+    max_N. Optionally handles precomputed or extracted shortest paths and MERW walks.
     """
-    # Check if paths are precomputed (3-tuple) or need extraction (2-tuple)
-    has_precomputed_paths = len(batch[0]) == 3 if batch else False
+    if not batch:
+        return ()
 
-    if has_precomputed_paths:
+    has_paths = use_path_embeddings
+    has_merw = use_merw
+
+    if has_paths and has_merw:
+        graphs, dist_list, precomp_paths, merw_list = zip(*batch)
+    elif has_paths:
         graphs, dist_list, precomp_paths = zip(*batch)
+        merw_list = None
+    elif has_merw:
+        graphs, dist_list, merw_list = zip(*batch)
+        precomp_paths = None
     else:
         graphs, dist_list = zip(*batch)
         precomp_paths = None
+        merw_list = None
 
     pyg_batch = torch_geometric.data.Batch.from_data_list(list(graphs))
 
@@ -650,14 +829,9 @@ def collate_with_dist_masks(batch, max_hops=40, use_path_embeddings=False,
         dm_padded = np.zeros((B, max_hops, max_N, max_N), dtype=np.float32)
     node_masks = np.zeros((B, max_N), dtype=np.bool_)
 
-    # Per-graph offsets for mapping node indices in batch
-    node_offsets = [0]
-    for g in graphs:
-        node_offsets.append(node_offsets[-1] + g.num_nodes)
-
     pred_padded = None
-    if use_path_embeddings:
-        assert has_precomputed_paths, "use_path_embeddings needs a predecessor store"
+    if has_paths:
+        assert precomp_paths is not None, "use_path_embeddings needs a predecessor store"
         pred_padded = np.full((B, max_N, max_N), -1, dtype=np.int16)
 
     for i, (g, dist) in enumerate(zip(graphs, dist_list)):
@@ -670,7 +844,7 @@ def collate_with_dist_masks(batch, max_hops=40, use_path_embeddings=False,
                 dm_padded[i, k, :n, :n] = (dist == k)
         node_masks[i, :n] = True
 
-        if use_path_embeddings:
+        if has_paths:
             pred_padded[i, :n, :n] = precomp_paths[i]
 
     result = (
@@ -679,7 +853,7 @@ def collate_with_dist_masks(batch, max_hops=40, use_path_embeddings=False,
         torch.from_numpy(node_masks),
     )
 
-    if use_path_embeddings:
+    if has_paths:
         path_data = {"pred": torch.from_numpy(pred_padded)}
         if dist_as_index:
             dist_pad = dm_padded
@@ -692,6 +866,20 @@ def collate_with_dist_masks(batch, max_hops=40, use_path_embeddings=False,
         path_data["levels"] = _path_levels(dist_pad, pred_padded, max_hops - 1)
         pyg_batch.path_data = path_data
         result = result + (path_data,)
+
+    if has_merw:
+        sample_paths, _ = merw_list[0]
+        num_paths = sample_paths.shape[1]
+        seq_len = sample_paths.shape[2]
+        paths_padded = np.zeros((B, max_N, num_paths, seq_len), dtype=np.int64)
+        dists_padded = np.zeros((B, max_N, num_paths, seq_len), dtype=np.int64)
+
+        for i, (g, (p_arr, d_arr)) in enumerate(zip(graphs, merw_list)):
+            n = int(g.num_nodes)
+            paths_padded[i, :n] = p_arr
+            dists_padded[i, :n] = d_arr
+
+        result = result + (torch.from_numpy(paths_padded), torch.from_numpy(dists_padded))
 
     return result
 
@@ -882,7 +1070,8 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
                 dataset_name="Peptides-func", return_info=False,
                 subgraph_mode="partition", num_parts=128, egonet_hops=2,
                 egonet_max_nodes=1024, max_egonet_samples=None, seed=0,
-                use_path_embeddings=False, dist_as_index=False):
+                use_path_embeddings=False, dist_as_index=False,
+                use_merw=False, merw_num_paths=20, merw_path_len=3):
     """Load train/val/test splits and return loaders + datasets.
 
     Args:
@@ -1033,13 +1222,27 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
             val_paths = precompute_predecessors(val_ds, val_dm, cache_dir, "val", dist_mask_workers)
             test_paths = precompute_predecessors(test_ds, test_dm, cache_dir, "test", dist_mask_workers)
 
-        train_wrapped = DistMaskDataset(train_ds, train_dm, train_paths)
-        val_wrapped = DistMaskDataset(val_ds, val_dm, val_paths)
-        test_wrapped = DistMaskDataset(test_ds, test_dm, test_paths)
+        # Precompute MERW paths if needed
+        train_merw = None
+        val_merw = None
+        test_merw = None
+        if use_merw:
+            print("Precomputing MERW paths...", flush=True)
+            train_merw = precompute_merw_paths(
+                train_ds, cache_dir, "train", merw_num_paths, merw_path_len, max_hops, dist_mask_workers)
+            val_merw = precompute_merw_paths(
+                val_ds, cache_dir, "val", merw_num_paths, merw_path_len, max_hops, dist_mask_workers)
+            test_merw = precompute_merw_paths(
+                test_ds, cache_dir, "test", merw_num_paths, merw_path_len, max_hops, dist_mask_workers)
+
+        train_wrapped = DistMaskDataset(train_ds, train_dm, path_store=train_paths, merw_store=train_merw)
+        val_wrapped = DistMaskDataset(val_ds, val_dm, path_store=val_paths, merw_store=val_merw)
+        test_wrapped = DistMaskDataset(test_ds, test_dm, path_store=test_paths, merw_store=test_merw)
 
         collate_fn = partial(collate_with_dist_masks, max_hops=max_hops,
                             use_path_embeddings=use_path_embeddings,
-                            dist_as_index=dist_as_index)
+                            dist_as_index=dist_as_index,
+                            use_merw=use_merw)
 
         # Use standard PyTorch DataLoader (not PyG's) because our custom
         # collate_fn handles batching and PyG's Collater cannot handle the

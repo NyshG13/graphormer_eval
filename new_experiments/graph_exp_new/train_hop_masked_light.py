@@ -135,6 +135,20 @@ def build_parser():
     p.add_argument("--use_path_embeddings", action="store_true", default=False,
                    help="Enable path-aware embeddings for K/V conditioning in attention.")
 
+    # MERW
+    p.add_argument("--use_merw", action="store_true", default=False,
+                   help="Enable Maximal Entropy Random Walk (MERW) path enrichment.")
+    p.add_argument("--merw_feature_type", type=str, default="node",
+                   choices=["node", "edge", "both"],
+                   help="Feature type for MERW path tokens: 'node', 'edge', or 'both'.")
+    p.add_argument("--merw_num_paths", type=int, default=20,
+                   help="Number of sampled MERW walks per node.")
+    p.add_argument("--merw_path_len", type=int, default=3,
+                   help="Number of steps/edges in each MERW walk.")
+    p.add_argument("--merw_merge", type=str, default="concat",
+                   choices=["concat", "conv", "cross_attn"],
+                   help="Method to merge tokens along a single walk.")
+
     # Training
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lr_min", type=float, default=1e-6)
@@ -180,15 +194,27 @@ def parse_args():
 
 
 def _move_batch_to_device(batch, device, max_hops):
-    # batch can be (pyg_batch, dist, node_masks) or
-    #             (pyg_batch, dist, node_masks, path_data)
-    # dist: int16 (B, N, N) distance index (-1 = none); the one-hot float
-    # (B, K, N, N) hop masks are built on the device.
-    if len(batch) == 4:
-        pyg_batch, dist, node_masks, path_data = batch
+    # batch can be:
+    #   (pyg_batch, dist, node_masks)                                    [len 3]
+    #   (pyg_batch, dist, node_masks, path_data)                         [len 4]
+    #   (pyg_batch, dist, node_masks, merw_paths, merw_dists)            [len 5]
+    #   (pyg_batch, dist, node_masks, path_data, merw_paths, merw_dists) [len 6]
+    path_data = None
+    merw_paths = None
+    merw_dists = None
+
+    if len(batch) == 5:
+        pyg_batch, dist, node_masks, merw_paths, merw_dists = batch
+    elif len(batch) == 6:
+        pyg_batch, dist, node_masks, path_data, merw_paths, merw_dists = batch
+    elif len(batch) == 4:
+        if isinstance(batch[3], dict):
+            pyg_batch, dist, node_masks, path_data = batch
+        else:
+            pyg_batch, dist, node_masks = batch[:3]
     else:
         pyg_batch, dist, node_masks = batch
-        path_data = None
+
     # path_data stays on CPU (the model moves what it needs); drop the copy the
     # collate attached to the batch so Batch.to() doesn't transfer it too.
     if getattr(pyg_batch, "path_data", None) is not None:
@@ -199,7 +225,13 @@ def _move_batch_to_device(batch, device, max_hops):
         dist_masks = (dist.unsqueeze(1) == hops.view(1, -1, 1, 1)).float()
     else:
         dist_masks = dist
-    return pyg_batch.to(device), dist_masks, node_masks.to(device), path_data
+
+    if merw_paths is not None:
+        merw_paths = merw_paths.to(device, non_blocking=True)
+    if merw_dists is not None:
+        merw_dists = merw_dists.to(device, non_blocking=True)
+
+    return pyg_batch.to(device), dist_masks, node_masks.to(device), path_data, merw_paths, merw_dists
 
 
 def run_epoch(model, loader, task, device, optimizer=None, scheduler=None,
@@ -210,7 +242,7 @@ def run_epoch(model, loader, task, device, optimizer=None, scheduler=None,
 
     losses, preds_acc, labels_acc = [], [], []
     for batch in loader:
-        pyg_batch, dist_masks, node_masks, path_data = _move_batch_to_device(
+        pyg_batch, dist_masks, node_masks, path_data, merw_paths, merw_dists = _move_batch_to_device(
             batch, device, model.max_hops)
         # Attach path_data to batch if present
         if path_data is not None:
@@ -220,7 +252,10 @@ def run_epoch(model, loader, task, device, optimizer=None, scheduler=None,
         with torch.set_grad_enabled(is_train):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
                                 enabled=amp and str(device).startswith("cuda")):
-                logits, _, aux_loss, _ = model(pyg_batch, dist_masks, node_masks)
+                logits, _, aux_loss, _ = model(
+                    pyg_batch, dist_masks, node_masks,
+                    merw_paths=merw_paths, merw_dists=merw_dists
+                )
             logits, aux_loss = logits.float(), aux_loss.float()
             task_loss = task.loss(logits, pyg_batch.y)
             loss = task_loss + aux_loss
@@ -255,11 +290,11 @@ def attn_diagnostics(model, loader, device, tag, max_batches=10):
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        pyg_batch, dist_masks, node_masks, path_data = _move_batch_to_device(
+        pyg_batch, dist_masks, node_masks, path_data, merw_paths, merw_dists = _move_batch_to_device(
             batch, device, model.max_hops)
         if path_data is not None:
             pyg_batch.path_data = path_data
-        model(pyg_batch, dist_masks, node_masks)
+        model(pyg_batch, dist_masks, node_masks, merw_paths=merw_paths, merw_dists=merw_dists)
     for m in mods:
         m.collect_stats = False
     model.train(was_training)
@@ -317,6 +352,9 @@ def main():
         num_parts=args.num_parts,
         egonet_hops=args.egonet_hops,
         egonet_max_nodes=args.egonet_max_nodes,
+        use_merw=args.use_merw,
+        merw_num_paths=args.merw_num_paths,
+        merw_path_len=args.merw_path_len,
     )
     dataset_name = dataset_info["name"]
 
@@ -361,6 +399,11 @@ def main():
         multihop_readout=args.multihop_readout,
         multihop_include_global=not args.multihop_no_global,
         use_path_embeddings=args.use_path_embeddings,
+        use_merw=args.use_merw,
+        merw_num_paths=args.merw_num_paths,
+        merw_path_len=args.merw_path_len,
+        merw_merge=args.merw_merge,
+        merw_feature_type=args.merw_feature_type,
     ).to(args.device)
 
     if args.multihop_attn:
