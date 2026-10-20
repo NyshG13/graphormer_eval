@@ -321,11 +321,18 @@ def evaluate(model, loader, device, proxy_fn=None):
 # ================================================================
 
 def compute_mae(y_pred: np.ndarray, y_true: np.ndarray) -> float:
-    """Mean Absolute Error — LRGB Peptides-struct standard metric."""
+    """Mean Absolute Error — LRGB Peptides-struct and ZINC standard metric."""
     if y_pred.size == 0:
         return 0.0
-    return float(np.mean(np.abs(y_pred.astype(np.float64)
-                                - y_true.astype(np.float64))))
+    y_p = y_pred.astype(np.float64)
+    y_t = y_true.astype(np.float64)
+    if y_p.shape != y_t.shape:
+        if y_p.size == y_t.size:
+            y_p = y_p.reshape(y_t.shape)
+        else:
+            y_p = y_p.squeeze()
+            y_t = y_t.squeeze()
+    return float(np.mean(np.abs(y_p - y_t)))
 
 
 def compute_node_f1_macro(y_pred: np.ndarray, y_true: np.ndarray) -> float:
@@ -504,7 +511,10 @@ class Task:
                 y_f = y_f * (1.0 - 2.0 * eps) + eps
             return self.loss_fn(logits, y_f)
         if self.task_type == "regression":
-            return self.loss_fn(logits, y.float())
+            y_float = y.float()
+            if logits.shape != y_float.shape:
+                logits = logits.view(y_float.shape)
+            return self.loss_fn(logits, y_float)
         if self.task_type == "multiclass":
             y = y.long()
             y = self._flatten_labels(y)
@@ -517,16 +527,16 @@ class Task:
         if self.task_type == "multi_label":
             return torch.sigmoid(logits).detach().cpu().numpy()
         if self.task_type == "regression":
-            return logits.detach().cpu().numpy()
+            arr = logits.detach().cpu().numpy()
+            return arr.squeeze(-1) if (arr.ndim > 1 and arr.shape[-1] == 1) else arr
         if self.task_type == "multiclass":
             return logits.argmax(dim=-1).detach().cpu().numpy()
         raise ValueError(f"Unknown task_type: {self.task_type}")
 
     def labels_to_numpy(self, y) -> np.ndarray:
         """Convert ground-truth tensors to numpy aligned with ``predict``."""
-        #if self.task_type == "multiclass":
-        #    return self._flatten_labels(y).detach().cpu().numpy()
-        return y.detach().cpu().numpy()
+        arr = y.detach().cpu().numpy()
+        return arr.squeeze(-1) if (arr.ndim > 1 and arr.shape[-1] == 1) else arr
 
     # --- Final metric -----------------------------------------------
     def compute_metric(self, preds: np.ndarray, labels: np.ndarray) -> float:
