@@ -526,12 +526,14 @@ def main():
             epochs_since_improve += 1
 
         ml = task.metric_label
+        test_str = f"{best_test:.4f}" if best_test is not None else "None"
+        cur_lr = optimizer.param_groups[0]["lr"]
         print(
-            f"epoch {epoch:03d} | {dt:5.1f}s | "
+            f"epoch {epoch:03d} | {dt:5.1f}s | lr {cur_lr:.2e} | "
             f"train loss {tr_loss:.4f} {ml} {tr_metric:.4f} | "
             f"val loss {va_loss:.4f} {ml} {va_metric:.4f} | "
             f"test loss {te_loss:.4f} {ml} {te_metric:.4f} | "
-            f"best val {best_val:.4f} (epoch {best_epoch}, test {best_test})",
+            f"best val {best_val:.4f} (epoch {best_epoch}, test {test_str})",
             flush=True,
         )
 
