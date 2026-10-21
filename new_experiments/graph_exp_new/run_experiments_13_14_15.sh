@@ -96,6 +96,53 @@ run_exp15() {
     echo "EXP 15 launched in background (PID $!). Tail logs with: tail -f log_zinc12k_edges_global_extended.log"
 }
 
+run_cora_iter2() {
+    echo "Starting Cora Iteration 2: Localized Walk Blending on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --blend_adj_power \
+        --max_hops 4 \
+        --num_heads 4 \
+        --num_layers 2 \
+        --ffn_ratio 4.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --hidden_dim 32 \
+        --dropout 0.6 \
+        --weight_decay 0.001 \
+        --lr 0.001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --save_dir checkpoints_cora_iter2_walk_blend \
+        --seed 0 > log_cora_iter2_walk_blend.log 2>&1 &
+    echo "Cora Iteration 2 launched in background (PID $!). Tail logs with: tail -f log_cora_iter2_walk_blend.log"
+}
+
+run_cora_iter3() {
+    echo "Starting Cora Iteration 3: Compressed Non-Linear Stride on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_nonlinear_hops.json \
+        --max_hops 9 \
+        --num_heads 4 \
+        --num_layers 2 \
+        --ffn_ratio 4.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --hidden_dim 32 \
+        --dropout 0.5 \
+        --weight_decay 0.0005 \
+        --lr 0.001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --save_dir checkpoints_cora_iter3_nonlinear_stride \
+        --seed 0 > log_cora_iter3_nonlinear_stride.log 2>&1 &
+    echo "Cora Iteration 3 launched in background (PID $!). Tail logs with: tail -f log_cora_iter3_nonlinear_stride.log"
+}
+
 case "$CMD" in
     13|exp13)
         run_exp13
@@ -106,14 +153,20 @@ case "$CMD" in
     15|exp15)
         run_exp15
         ;;
+    cora2|cora_iter2)
+        run_cora_iter2
+        ;;
+    cora3|cora_iter3)
+        run_cora_iter3
+        ;;
     all)
         run_exp13
         run_exp14
         run_exp15
         ;;
     *)
-        echo "Usage: ./run_experiments_13_14_15.sh [13|14|15|all] [GPU_ID (default: 0)]"
-        echo "Example: ./run_experiments_13_14_15.sh 13 0"
+        echo "Usage: ./run_experiments_13_14_15.sh [13|14|15|cora2|cora3|all] [GPU_ID (default: 0)]"
+        echo "Example: ./run_experiments_13_14_15.sh cora2 0"
         exit 1
         ;;
 esac
