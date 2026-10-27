@@ -112,6 +112,10 @@ def build_parser():
     p.add_argument("--hop_window", type=int, default=1)
     p.add_argument("--num_global_heads", type=int, default=0)
     p.add_argument("--hop_file", type=str, default=None)
+    p.add_argument("--no_random_global", action="store_true", default=False,
+                   help="Disable random hop-to-global head promotion augmentation during training (default: False).")
+    p.add_argument("--random_global_prob", type=float, default=None,
+                   help="Explicit probability for random hop-to-global head promotion (default: dropout/2).")
 
     # Multi-hop attention
     p.add_argument("--multihop_attn", action="store_true", default=False)
@@ -404,6 +408,8 @@ def main():
         merw_path_len=args.merw_path_len,
         merw_merge=args.merw_merge,
         merw_feature_type=args.merw_feature_type,
+        use_random_global=not args.no_random_global,
+        random_global_prob=args.random_global_prob,
     ).to(args.device)
 
     if args.multihop_attn:
@@ -413,6 +419,12 @@ def main():
         print("Head -> hop set assignment:", flush=True)
         for h, s in enumerate(model.head_hop_sets):
             print(f"  head {h}: {'GLOBAL' if s is None else s}", flush=True)
+
+    if not args.no_random_global and ((args.random_global_prob is not None and args.random_global_prob > 0) or args.dropout > 0):
+        prob_str = f"{args.random_global_prob:.3f}" if args.random_global_prob is not None else f"dropout/2 ({args.dropout/2:.3f})"
+        print(f"Random global head augmentation: ENABLED (p={prob_str})", flush=True)
+    else:
+        print("Random global head augmentation: DISABLED", flush=True)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"trainable params: {n_params/1e6:.3f}M", flush=True)

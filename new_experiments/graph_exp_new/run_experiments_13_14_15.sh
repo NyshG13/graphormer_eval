@@ -119,6 +119,30 @@ run_cora_iter2() {
     echo "Cora Iteration 2 launched in background (PID $!). Tail logs with: tail -f log_cora_iter2_walk_blend.log"
 }
 
+run_cora_iter2_no_aug() {
+    echo "Starting Cora Iteration 2 (WITHOUT Random Global Augmentation) on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --blend_adj_power \
+        --max_hops 4 \
+        --num_heads 4 \
+        --num_layers 2 \
+        --ffn_ratio 4.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --hidden_dim 32 \
+        --dropout 0.6 \
+        --weight_decay 0.001 \
+        --lr 0.001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --save_dir checkpoints_cora_iter2_no_random_global \
+        --seed 0 > log_cora_iter2_no_random_global.log 2>&1 &
+    echo "Cora Iteration 2 (No Aug) launched in background (PID $!). Tail logs with: tail -f log_cora_iter2_no_random_global.log"
+}
+
 run_cora_iter3() {
     echo "Starting Cora Iteration 3: Compressed Non-Linear Stride on GPU ${GPU}..."
     CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
@@ -143,9 +167,60 @@ run_cora_iter3() {
     echo "Cora Iteration 3 launched in background (PID $!). Tail logs with: tail -f log_cora_iter3_nonlinear_stride.log"
 }
 
+run_cora_iter3_no_aug() {
+    echo "Starting Cora Iteration 3: Compressed Non-Linear Stride (WITHOUT Random Global Augmentation) on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_nonlinear_hops.json \
+        --max_hops 9 \
+        --num_heads 4 \
+        --num_layers 2 \
+        --ffn_ratio 4.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --hidden_dim 32 \
+        --dropout 0.5 \
+        --weight_decay 0.0005 \
+        --lr 0.001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --save_dir checkpoints_cora_iter3_no_random_global \
+        --seed 0 > log_cora_iter3_no_random_global.log 2>&1 &
+    echo "Cora Iteration 3 (No Aug) launched in background (PID $!). Tail logs with: tail -f log_cora_iter3_no_random_global.log"
+}
+
+run_exp13_no_aug() {
+    echo "Starting EXP 13: Cora Vanilla Tuned (WITHOUT Random Global Augmentation) on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hidden_dim 128 \
+        --num_heads 8 \
+        --num_layers 2 \
+        --ffn_ratio 4.0 \
+        --max_hops 9 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --dropout 0.5 \
+        --weight_decay 0.0005 \
+        --lr 0.001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --save_dir checkpoints_cora_vanilla_no_pemb_no_random_global \
+        --seed 0 > log_cora_vanilla_no_pemb_no_random_global.log 2>&1 &
+    echo "EXP 13 (No Aug) launched in background (PID $!). Tail logs with: tail -f log_cora_vanilla_no_pemb_no_random_global.log"
+}
+
 case "$CMD" in
     13|exp13)
         run_exp13
+        ;;
+    13_no_aug|exp13_no_aug)
+        run_exp13_no_aug
         ;;
     14|exp14)
         run_exp14
@@ -156,8 +231,14 @@ case "$CMD" in
     cora2|cora_iter2)
         run_cora_iter2
         ;;
+    cora2_no_aug|cora_iter2_no_aug)
+        run_cora_iter2_no_aug
+        ;;
     cora3|cora_iter3)
         run_cora_iter3
+        ;;
+    cora3_no_aug|cora_iter3_no_aug)
+        run_cora_iter3_no_aug
         ;;
     all)
         run_exp13
@@ -165,8 +246,8 @@ case "$CMD" in
         run_exp15
         ;;
     *)
-        echo "Usage: ./run_experiments_13_14_15.sh [13|14|15|cora2|cora3|all] [GPU_ID (default: 0)]"
-        echo "Example: ./run_experiments_13_14_15.sh cora2 0"
+        echo "Usage: ./run_experiments_13_14_15.sh [13|13_no_aug|14|15|cora2|cora2_no_aug|cora3|cora3_no_aug|all] [GPU_ID (default: 0)]"
+        echo "Example: ./run_experiments_13_14_15.sh cora3_no_aug 0"
         exit 1
         ;;
 esac

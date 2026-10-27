@@ -1355,6 +1355,8 @@ class HopMaskedTransformerModel(nn.Module):
         multihop_readout: str = "sum",
         multihop_include_global: bool = True,
         embed_dropout: float = 0.0,
+        use_random_global: bool = True,
+        random_global_prob: Optional[float] = None,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -1389,6 +1391,8 @@ class HopMaskedTransformerModel(nn.Module):
         # per-sublayer ``dropout`` so it can be tuned independently.
         self.embed_drop = nn.Dropout(embed_dropout)
         self.dropout = dropout
+        self.use_random_global = use_random_global
+        self.random_global_prob = random_global_prob
 
         # ----- Per-layer hop sets (alternating mode) or shared -----
         if self.use_alternating:
@@ -1959,12 +1963,19 @@ class HopMaskedTransformerModel(nn.Module):
                 )
 
                 # Random global head promotion: during training, randomly
-                # make some heads attend globally with prob dropout/2.
-                if self.training and self.dropout > 0:
+                # make some heads attend globally with prob dropout/2 (or explicit prob).
+                p_global = 0.0
+                if self.use_random_global and self.training:
+                    if self.random_global_prob is not None:
+                        p_global = self.random_global_prob
+                    elif self.dropout > 0:
+                        p_global = self.dropout / 2
+
+                if p_global > 0:
                     B_cur = per_head_mask.shape[0]
                     random_global = torch.rand(
                         B_cur, self.num_heads, device=x.device,
-                    ) < (self.dropout / 2)
+                    ) < p_global
                     per_head_mask[random_global] = True
 
                 # ── Head validity mask for cross-hop mixer ────────────────

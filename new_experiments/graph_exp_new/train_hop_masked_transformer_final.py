@@ -205,6 +205,10 @@ def build_parser():
                         "By default each head also computes one unmasked "
                         "(padding-only) attention output on top of the K "
                         "hop-masked outputs.")
+    p.add_argument("--no_random_global", action="store_true", default=False,
+                   help="Disable random hop-to-global head promotion augmentation during training (default: False).")
+    p.add_argument("--random_global_prob", type=float, default=None,
+                   help="Explicit probability for random hop-to-global head promotion (default: dropout/2).")
     p.add_argument("--use_edge_features", action="store_true", default=False,
                    help="Incorporate edge/bond features: a BondEncoder embeds "
                         "edge_attr, aggregated into node features in the node "
@@ -683,7 +687,9 @@ def main():
         multihop_attn=args.multihop_attn,
         multihop_readout=args.multihop_readout,
         multihop_include_global=not args.multihop_no_global,
-        embed_dropout=args.dropout
+        embed_dropout=args.dropout,
+        use_random_global=not args.no_random_global,
+        random_global_prob=args.random_global_prob,
     ).to(args.device)
 
     # Print the head -> hop-set assignment so it's logged for reproducibility.
@@ -700,6 +706,12 @@ def main():
         print("Head -> hop set assignment:", flush=True)
         for h, s in enumerate(model.head_hop_sets):
             print(f"  head {h}: {'GLOBAL (no hop mask)' if s is None else s}", flush=True)
+
+    if not args.no_random_global and ((args.random_global_prob is not None and args.random_global_prob > 0) or args.dropout > 0):
+        prob_str = f"{args.random_global_prob:.3f}" if args.random_global_prob is not None else f"dropout/2 ({args.dropout/2:.3f})"
+        print(f"Random global head augmentation: ENABLED (p={prob_str})", flush=True)
+    else:
+        print("Random global head augmentation: DISABLED", flush=True)
     if args.hop_mode == "file":
         print(f"Loaded head->hop assignment from file: {args.hop_file}", flush=True)
     if args.use_virtual_node:

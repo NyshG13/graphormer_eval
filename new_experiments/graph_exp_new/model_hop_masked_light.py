@@ -1130,6 +1130,8 @@ class HopMaskedTransformerModel(nn.Module):
         merw_path_len: int = 3,
         merw_merge: str = "concat",
         merw_feature_type: str = "node",
+        use_random_global: bool = True,
+        random_global_prob: Optional[float] = None,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -1153,6 +1155,8 @@ class HopMaskedTransformerModel(nn.Module):
         self.use_edge_bias = use_edge_bias
         self.embed_drop = nn.Dropout(embed_dropout)
         self.dropout = dropout
+        self.use_random_global = use_random_global
+        self.random_global_prob = random_global_prob
 
         # Hop-to-head assignment
         if self.use_alternating:
@@ -1579,12 +1583,19 @@ class HopMaskedTransformerModel(nn.Module):
                     base_masks[id(hs)] = self._build_per_head_mask(mask_source, hs)
                 per_head_mask = base_masks[id(hs)]
 
-                if self.training and self.dropout > 0:
+                p_global = 0.0
+                if self.use_random_global and self.training:
+                    if self.random_global_prob is not None:
+                        p_global = self.random_global_prob
+                    elif self.dropout > 0:
+                        p_global = self.dropout / 2
+
+                if p_global > 0:
                     per_head_mask = per_head_mask.clone()  # modified in place below
                     B_cur = per_head_mask.shape[0]
                     random_global = torch.rand(
                         B_cur, self.num_heads, device=x.device,
-                    ) < (self.dropout / 2)
+                    ) < p_global
                     per_head_mask[random_global] = True
 
                 head_valid_mask = None
