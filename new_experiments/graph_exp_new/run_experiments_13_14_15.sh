@@ -370,6 +370,33 @@ run_cora_exp6() {
     echo "EXP 6 launched in background (PID $!). Tail logs with: tail -f log_cora_exp6_embed_dropout.log"
 }
 
+run_cora_combo_b() {
+    echo "Starting Combination B: Cora Option C WITH Ego-Biased Hops (2 on hop 0, 8 on hop 1, 4 on hop 2, 2 on hop 3, NO hop 4) + Feature Norm on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_4hops_ego_biased_16heads.json \
+        --max_hops 4 \
+        --num_heads 16 \
+        --hidden_dim 128 \
+        --num_layers 2 \
+        --ffn_ratio 2.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --dropout 0.6 \
+        --weight_decay 0.0005 \
+        --lr 0.002 \
+        --lr_min 0.0001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 30 \
+        --no_random_global \
+        --normalize_features \
+        --save_dir checkpoints_cora_combo_b_ego_biased \
+        --seed 0 > log_cora_combo_b_ego_biased.log 2>&1 &
+    echo "Combination B launched in background (PID $!). Tail logs with: tail -f log_cora_combo_b_ego_biased.log"
+}
+
 case "$CMD" in
     13|exp13)
         run_exp13
@@ -413,14 +440,17 @@ case "$CMD" in
     exp6|cora_exp6)
         run_cora_exp6
         ;;
+    combo_b|cora_combo_b|b)
+        run_cora_combo_b
+        ;;
     all)
         run_exp13
         run_exp14
         run_exp15
         ;;
     *)
-        echo "Usage: ./run_experiments_13_14_15.sh [13|13_no_aug|14|15|cora2|cora2_no_aug|cora3|cora3_no_aug|cora_opt_a|cora_opt_b|cora_opt_c|exp4|exp5|exp6|all] [GPU_ID (default: 0)]"
-        echo "Example: ./run_experiments_13_14_15.sh exp4 0"
+        echo "Usage: ./run_experiments_13_14_15.sh [13|13_no_aug|14|15|cora2|cora2_no_aug|cora3|cora3_no_aug|cora_opt_a|cora_opt_b|cora_opt_c|exp4|exp5|exp6|combo_b|all] [GPU_ID (default: 0)]"
+        echo "Example: ./run_experiments_13_14_15.sh combo_b 0"
         exit 1
         ;;
 esac

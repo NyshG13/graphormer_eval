@@ -1483,7 +1483,13 @@ class HopMaskedTransformerModel(nn.Module):
         eye = torch.eye(N, device=dist_masks.device, dtype=torch.bool)
         non_self = out & ~eye[None, None]
         has_nonself = non_self.any(dim=-1).any(dim=-1)
-        out[~has_nonself] = True
+        is_self_only = torch.tensor(
+            [hs == [0] for hs in hop_sets],
+            device=dist_masks.device,
+            dtype=torch.bool,
+        )
+        promote = (~has_nonself) & (~is_self_only.unsqueeze(0))
+        out[promote] = True
 
         return out
 
