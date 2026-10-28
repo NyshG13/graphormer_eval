@@ -762,21 +762,23 @@ class HopMaskedTransformerLayer(nn.Module):
         multihop_include_global: bool = True,
         use_path_gate: bool = False,
         multihop_grouped: bool = False,
+        attn_dropout: Optional[float] = None,
     ):
         super().__init__()
         self.multihop_attn = multihop_attn
         self.norm1 = build_norm(norm_type, hidden_dim)
 
+        attn_p = attn_dropout if attn_dropout is not None else dropout
         if multihop_attn:
             self.attn = MultiHopMaskedMHA(
-                hidden_dim, num_heads, dropout,
+                hidden_dim, num_heads, attn_p,
                 block_diag_out=block_diag_out,
                 readout=multihop_readout, include_global=multihop_include_global,
                 use_path_gate=use_path_gate, grouped_softmax=multihop_grouped,
             )
         else:
             self.attn = HopMaskedMHA(
-                hidden_dim, num_heads, dropout, block_diag_out=block_diag_out,
+                hidden_dim, num_heads, attn_p, block_diag_out=block_diag_out,
                 blend_adj_power=blend_adj_power, use_edge_bias=use_edge_bias,
                 use_path_gate=use_path_gate,
             )
@@ -1132,6 +1134,8 @@ class HopMaskedTransformerModel(nn.Module):
         merw_feature_type: str = "node",
         use_random_global: bool = True,
         random_global_prob: Optional[float] = None,
+        linear_head: bool = False,
+        attn_dropout: Optional[float] = None,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -1270,6 +1274,7 @@ class HopMaskedTransformerModel(nn.Module):
                     multihop_include_global=multihop_include_global,
                     use_path_gate=use_path_embeddings,
                     multihop_grouped=(multihop_attn and mask_type == "shortest_path"),
+                    attn_dropout=attn_dropout,
                 )
             )
         self.layers = nn.ModuleList(layers)
@@ -1278,13 +1283,20 @@ class HopMaskedTransformerModel(nn.Module):
         if graph_pool == "attention":
             self.readout = AttentionReadout(hidden_dim, num_heads, dropout=dropout)
 
-        self.head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-        )
+        if linear_head:
+            self.head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        else:
+            self.head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
 
         if num_post_gat_layers > 0:
             self.post_gat = PostGATv2Block(

@@ -93,6 +93,10 @@ def build_parser():
     p.add_argument("--ffn_ratio", type=float, default=4.0)
     p.add_argument("--num_layers", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--attn_dropout", type=float, default=None,
+                   help="Dropout rate for attention weights (default: same as --dropout).")
+    p.add_argument("--linear_head", action="store_true", default=False,
+                   help="Use single linear layer classifier head instead of 2-layer MLP head.")
     p.add_argument("--embed_dropout", type=float, default=0.0,
                    help="Dropout rate for initial node embeddings before transformer layers.")
     p.add_argument("--graph_pool", type=str, default="sum",
@@ -416,6 +420,8 @@ def main():
         merw_feature_type=args.merw_feature_type,
         use_random_global=not args.no_random_global,
         random_global_prob=args.random_global_prob,
+        linear_head=args.linear_head,
+        attn_dropout=args.attn_dropout,
     ).to(args.device)
 
     if args.multihop_attn:
