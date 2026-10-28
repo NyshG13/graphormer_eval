@@ -215,6 +215,81 @@ run_exp13_no_aug() {
     echo "EXP 13 (No Aug) launched in background (PID $!). Tail logs with: tail -f log_cora_vanilla_no_pemb_no_random_global.log"
 }
 
+run_cora_opt_a() {
+    echo "Starting Cora Option A (dim 64, 8 heads, 2 heads/hop) on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_4hops_8heads.json \
+        --max_hops 5 \
+        --num_heads 8 \
+        --hidden_dim 64 \
+        --num_layers 2 \
+        --ffn_ratio 2.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --dropout 0.6 \
+        --weight_decay 0.001 \
+        --lr 0.001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --save_dir checkpoints_cora_opt_a_dim64_h8 \
+        --seed 0 > log_cora_opt_a_dim64_h8.log 2>&1 &
+    echo "Cora Option A launched in background (PID $!). Tail logs with: tail -f log_cora_opt_a_dim64_h8.log"
+}
+
+run_cora_opt_b() {
+    echo "Starting Cora Option B (dim 128, 8 heads, head_dim 16) on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_4hops_8heads.json \
+        --max_hops 5 \
+        --num_heads 8 \
+        --hidden_dim 128 \
+        --num_layers 2 \
+        --ffn_ratio 2.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --dropout 0.6 \
+        --weight_decay 0.001 \
+        --lr 0.001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --save_dir checkpoints_cora_opt_b_dim128_h8 \
+        --seed 0 > log_cora_opt_b_dim128_h8.log 2>&1 &
+    echo "Cora Option B launched in background (PID $!). Tail logs with: tail -f log_cora_opt_b_dim128_h8.log"
+}
+
+run_cora_opt_c() {
+    echo "Starting Cora Option C (dim 128, 16 heads, 4 heads/hop) on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_4hops_16heads.json \
+        --max_hops 5 \
+        --num_heads 16 \
+        --hidden_dim 128 \
+        --num_layers 2 \
+        --ffn_ratio 2.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --dropout 0.6 \
+        --weight_decay 0.001 \
+        --lr 0.001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --save_dir checkpoints_cora_opt_c_dim128_h16 \
+        --seed 0 > log_cora_opt_c_dim128_h16.log 2>&1 &
+    echo "Cora Option C launched in background (PID $!). Tail logs with: tail -f log_cora_opt_c_dim128_h16.log"
+}
+
 case "$CMD" in
     13|exp13)
         run_exp13
@@ -240,14 +315,23 @@ case "$CMD" in
     cora3_no_aug|cora_iter3_no_aug)
         run_cora_iter3_no_aug
         ;;
+    cora_opt_a|opt_a)
+        run_cora_opt_a
+        ;;
+    cora_opt_b|opt_b)
+        run_cora_opt_b
+        ;;
+    cora_opt_c|opt_c)
+        run_cora_opt_c
+        ;;
     all)
         run_exp13
         run_exp14
         run_exp15
         ;;
     *)
-        echo "Usage: ./run_experiments_13_14_15.sh [13|13_no_aug|14|15|cora2|cora2_no_aug|cora3|cora3_no_aug|all] [GPU_ID (default: 0)]"
-        echo "Example: ./run_experiments_13_14_15.sh cora3_no_aug 0"
+        echo "Usage: ./run_experiments_13_14_15.sh [13|13_no_aug|14|15|cora2|cora2_no_aug|cora3|cora3_no_aug|cora_opt_a|cora_opt_b|cora_opt_c|all] [GPU_ID (default: 0)]"
+        echo "Example: ./run_experiments_13_14_15.sh cora_opt_a 0"
         exit 1
         ;;
 esac
