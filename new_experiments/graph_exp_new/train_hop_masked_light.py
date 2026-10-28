@@ -93,6 +93,8 @@ def build_parser():
     p.add_argument("--ffn_ratio", type=float, default=4.0)
     p.add_argument("--num_layers", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--embed_dropout", type=float, default=0.0,
+                   help="Dropout rate for initial node embeddings before transformer layers.")
     p.add_argument("--graph_pool", type=str, default="sum",
                    choices=["sum", "mean", "attention"])
     p.add_argument("--norm_type", type=str, default="layer",
@@ -185,6 +187,8 @@ def build_parser():
                         "affordable for max_hops=20 dense masks.")
     p.add_argument("--egonet_hops", type=int, default=2)
     p.add_argument("--egonet_max_nodes", type=int, default=1024)
+    p.add_argument("--normalize_features", action="store_true", default=False,
+                   help="Row-normalize node features (L1 norm, sum=1) for Planetoid datasets.")
     return p
 
 
@@ -359,6 +363,7 @@ def main():
         use_merw=args.use_merw,
         merw_num_paths=args.merw_num_paths,
         merw_path_len=args.merw_path_len,
+        normalize_features=args.normalize_features,
     )
     dataset_name = dataset_info["name"]
 
@@ -402,6 +407,7 @@ def main():
         multihop_attn=args.multihop_attn,
         multihop_readout=args.multihop_readout,
         multihop_include_global=not args.multihop_no_global,
+        embed_dropout=args.embed_dropout,
         use_path_embeddings=args.use_path_embeddings,
         use_merw=args.use_merw,
         merw_num_paths=args.merw_num_paths,

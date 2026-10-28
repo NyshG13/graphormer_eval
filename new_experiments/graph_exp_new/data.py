@@ -1071,7 +1071,8 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
                 subgraph_mode="partition", num_parts=128, egonet_hops=2,
                 egonet_max_nodes=1024, max_egonet_samples=None, seed=0,
                 use_path_embeddings=False, dist_as_index=False,
-                use_merw=False, merw_num_paths=20, merw_path_len=3):
+                use_merw=False, merw_num_paths=20, merw_path_len=3,
+                normalize_features=False):
     """Load train/val/test splits and return loaders + datasets.
 
     Args:
@@ -1134,7 +1135,8 @@ def get_loaders(batch_size=256, num_workers=4, use_dist_masks=False, max_hops=40
             dataset_name, root="./data", subgraph_mode=subgraph_mode,
             num_parts=num_parts, egonet_hops=egonet_hops,
             egonet_max_nodes=egonet_max_nodes,
-            max_egonet_samples=max_egonet_samples, seed=seed)
+            max_egonet_samples=max_egonet_samples, seed=seed,
+            normalize_features=normalize_features)
         if transform is not None:
             tr = [transform(g) for g in tr]
             va = [transform(g) for g in va]

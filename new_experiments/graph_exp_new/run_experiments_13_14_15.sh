@@ -290,6 +290,86 @@ run_cora_opt_c() {
     echo "Cora Option C launched in background (PID $!). Tail logs with: tail -f log_cora_opt_c_dim128_h16.log"
 }
 
+run_cora_exp4() {
+    echo "Starting EXP 4: Cora Option C WITH Feature Normalization on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_4hops_16heads.json \
+        --max_hops 5 \
+        --num_heads 16 \
+        --hidden_dim 128 \
+        --num_layers 2 \
+        --ffn_ratio 2.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --dropout 0.6 \
+        --weight_decay 0.0005 \
+        --lr 0.002 \
+        --lr_min 0.0001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --normalize_features \
+        --save_dir checkpoints_cora_exp4_norm_features \
+        --seed 0 > log_cora_exp4_norm_features.log 2>&1 &
+    echo "EXP 4 launched in background (PID $!). Tail logs with: tail -f log_cora_exp4_norm_features.log"
+}
+
+run_cora_exp5() {
+    echo "Starting EXP 5: Cora Option C WITH Unequal Hop Allocation (8 on 1-hop, 4 on 2-hop, 2 on 3-hop, 2 on 4-hop) on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_4hops_biased_16heads.json \
+        --max_hops 5 \
+        --num_heads 16 \
+        --hidden_dim 128 \
+        --num_layers 2 \
+        --ffn_ratio 2.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --dropout 0.6 \
+        --weight_decay 0.0005 \
+        --lr 0.002 \
+        --lr_min 0.0001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --save_dir checkpoints_cora_exp5_unequal_hops \
+        --seed 0 > log_cora_exp5_unequal_hops.log 2>&1 &
+    echo "EXP 5 launched in background (PID $!). Tail logs with: tail -f log_cora_exp5_unequal_hops.log"
+}
+
+run_cora_exp6() {
+    echo "Starting EXP 6: Cora Option C WITH Input Embed Dropout (0.5) on GPU ${GPU}..."
+    CUDA_VISIBLE_DEVICES=${GPU} nohup python -u train_hop_masked_light.py \
+        --dataset cora \
+        --hop_mode file \
+        --hop_file cora_4hops_16heads.json \
+        --max_hops 5 \
+        --num_heads 16 \
+        --hidden_dim 128 \
+        --num_layers 2 \
+        --ffn_ratio 2.0 \
+        --num_parts 1 \
+        --batch_size 1 \
+        --dropout 0.6 \
+        --embed_dropout 0.5 \
+        --weight_decay 0.0005 \
+        --lr 0.002 \
+        --lr_min 0.0001 \
+        --max_epochs 500 \
+        --patience 100 \
+        --reduce_lr_patience 25 \
+        --no_random_global \
+        --save_dir checkpoints_cora_exp6_embed_dropout \
+        --seed 0 > log_cora_exp6_embed_dropout.log 2>&1 &
+    echo "EXP 6 launched in background (PID $!). Tail logs with: tail -f log_cora_exp6_embed_dropout.log"
+}
+
 case "$CMD" in
     13|exp13)
         run_exp13
@@ -324,14 +404,23 @@ case "$CMD" in
     cora_opt_c|opt_c)
         run_cora_opt_c
         ;;
+    exp4|cora_exp4)
+        run_cora_exp4
+        ;;
+    exp5|cora_exp5)
+        run_cora_exp5
+        ;;
+    exp6|cora_exp6)
+        run_cora_exp6
+        ;;
     all)
         run_exp13
         run_exp14
         run_exp15
         ;;
     *)
-        echo "Usage: ./run_experiments_13_14_15.sh [13|13_no_aug|14|15|cora2|cora2_no_aug|cora3|cora3_no_aug|cora_opt_a|cora_opt_b|cora_opt_c|all] [GPU_ID (default: 0)]"
-        echo "Example: ./run_experiments_13_14_15.sh cora_opt_a 0"
+        echo "Usage: ./run_experiments_13_14_15.sh [13|13_no_aug|14|15|cora2|cora2_no_aug|cora3|cora3_no_aug|cora_opt_a|cora_opt_b|cora_opt_c|exp4|exp5|exp6|all] [GPU_ID (default: 0)]"
+        echo "Example: ./run_experiments_13_14_15.sh exp4 0"
         exit 1
         ;;
 esac

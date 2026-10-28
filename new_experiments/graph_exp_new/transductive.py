@@ -43,6 +43,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import subgraph, to_undirected, k_hop_subgraph
 
@@ -69,7 +70,8 @@ def _load_ogbn(name: str, root: str) -> Tuple[Data, Dict[str, torch.Tensor]]:
     return data, {k: v.view(-1) for k, v in split.items()}
 
 
-def _load_planetoid(name: str, root: str) -> Tuple[Data, Dict[str, torch.Tensor]]:
+def _load_planetoid(name: str, root: str,
+                    normalize_features: bool = False) -> Tuple[Data, Dict[str, torch.Tensor]]:
     """Load a Planetoid graph (Cora / CiteSeer / PubMed) with its standard splits.
 
     PyG stores splits as boolean masks on the single Data object.  We convert
@@ -91,6 +93,8 @@ def _load_planetoid(name: str, root: str) -> Tuple[Data, Dict[str, torch.Tensor]
     data.y = data.y.view(-1).long()
     if data.x is not None:
         data.x = data.x.float()
+        if normalize_features:
+            data.x = F.normalize(data.x, p=1, dim=-1)
 
     def _mask_to_idx(mask: torch.Tensor) -> torch.Tensor:
         return mask.nonzero(as_tuple=False).view(-1).sort()[0]
@@ -139,7 +143,8 @@ def _load_arxiv_year(root: str, seed: int = 0,
 
 
 def load_transductive_graph(dataset_name: str, root: str,
-                            seed: int = 0) -> Tuple[Data, Dict[str, torch.Tensor]]:
+                            seed: int = 0,
+                            normalize_features: bool = False) -> Tuple[Data, Dict[str, torch.Tensor]]:
     """Dispatch to the right loader and symmetrise the edge index.
 
     Hop distances are computed on the undirected graph (``floyd_warshall`` is
@@ -148,7 +153,7 @@ def load_transductive_graph(dataset_name: str, root: str,
     """
     _planetoid_names = {"Cora", "CiteSeer", "PubMed"}
     if dataset_name in _planetoid_names:
-        data, split = _load_planetoid(dataset_name, root)
+        data, split = _load_planetoid(dataset_name, root, normalize_features=normalize_features)
     elif dataset_name == "arxiv-year":
         data, split = _load_arxiv_year(root, seed=seed)
     elif dataset_name in ("ogbn-arxiv", "ogbn-products"):
@@ -298,9 +303,10 @@ def build_transductive_splits(dataset_name: str, root: str = "./data",
                               egonet_max_nodes: int = 1024,
                               max_egonet_samples: int = None,
                               seed: int = 0,
+                              normalize_features: bool = False,
                               ) -> Tuple[List[Data], List[Data], List[Data]]:
     """Return ``(train_list, val_list, test_list)`` of small PyG ``Data`` graphs."""
-    data, split = load_transductive_graph(dataset_name, root, seed=seed)
+    data, split = load_transductive_graph(dataset_name, root, seed=seed, normalize_features=normalize_features)
 
     if subgraph_mode == "partition":
         avg = data.num_nodes / max(num_parts, 1)
